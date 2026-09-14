@@ -2,6 +2,8 @@
 
 Запуск: python test_watcher.py
 """
+from datetime import datetime
+
 import config
 import watcher
 
@@ -239,6 +241,85 @@ def test_pending_alert_delivered_despite_baseline_drift():
     assert row[0] == "sent"
 
 
+class FakeResponse:
+    def __init__(self, status_code=200, json_body=None, headers=None, url="https://api.travelpayouts.com/x"):
+        self.status_code = status_code
+        self._json_body = json_body
+        self.headers = headers or {}
+        self.url = url
+
+    def json(self):
+        return self._json_body
+
+
+def test_telegram_429_uses_retry_after_not_generic_backoff():
+    """REV-023: flush_pending_alerts должен взять next_attempt_at из
+    Retry-After, а не из общего exponential backoff, при 429 от Telegram."""
+    conn = watcher.init_db(":memory:")
+    route = dict(TEST_ROUTE)
+    rid = watcher.route_id(route)
+    watcher.claim_alert(conn, rid, route, make_entry(777))
+
+    def fake_post(url, json, timeout):
+        return FakeResponse(status_code=429, headers={"Retry-After": "600"})
+
+    original_post = watcher.requests.post
+    watcher.requests.post = fake_post
+    try:
+        watcher.flush_pending_alerts(conn, route, rid)
+    finally:
+        watcher.requests.post = original_post
+
+    row = conn.execute(
+        "SELECT status, next_attempt_at FROM alerts WHERE route_id=?", (rid,)
+    ).fetchone()
+    assert row[0] == "pending"
+    next_attempt_at = datetime.fromisoformat(row[1])
+    now = datetime.now(next_attempt_at.tzinfo)
+    delay = (next_attempt_at - now).total_seconds()
+    # общий backoff на первой попытке был бы POLL_INTERVAL_SECONDS*2 (обычно
+    # десятки секунд) — Retry-After=600 должен явно доминировать
+    assert delay > 500, f"ожидали ~600с из Retry-After, получили {delay:.0f}с"
+
+
+def test_request_spacing_keeps_burst_within_budget():
+    """REV-024: N запросов, равномерно разнесённых на compute_request_spacing
+    секунд, не превышают MAX_REQUESTS_PER_MINUTE — даже мгновенным всплеском."""
+    n = 100
+    interval = 20
+    budget = 60
+    # имитируем ситуацию из ревью: 100 маршрутов, интервал 20с, бюджет 60/мин —
+    # без реального MAX_REQUESTS_PER_MINUTE=60 здесь эффективный интервал
+    # должен быть выставлен вызывающей стороной (compute_effective_interval),
+    # но сама пропорция должна держать темп в рамках бюджета при любом interval.
+    effective_interval = max(interval, -(-n * 60 // budget))  # эквивалент math.ceil
+    spacing = watcher.compute_request_spacing(effective_interval, n)
+    requests_per_minute = 60 / spacing
+    assert requests_per_minute <= budget + 1e-6, (
+        f"{requests_per_minute:.1f} запросов/мин превышает бюджет {budget}"
+    )
+
+    assert watcher.compute_request_spacing(20, 0) == 20  # без маршрутов — не делим на ноль
+
+
+def test_fetch_cheapest_handles_malformed_shapes_without_raising():
+    """REV-025: неожиданная форма JSON (не dict, data не список, элементы не
+    dict) не должна бросать AttributeError — только None + лог."""
+    route = dict(TEST_ROUTE)
+
+    for body in ([], {"data": "not-a-list"}, {"data": ["not-a-dict"]}, {"data": [{}]}):
+        def fake_get(url, params, headers, timeout, _body=body):
+            return FakeResponse(status_code=200, json_body=_body)
+
+        original_get = watcher.requests.get
+        watcher.requests.get = fake_get
+        try:
+            result = watcher.fetch_cheapest(route, "token", {})
+        finally:
+            watcher.requests.get = original_get
+        assert result is None, f"неожиданная форма {body!r} должна давать None, не исключение"
+
+
 def run_all():
     tests = [
         test_is_anomaly_boundary,
@@ -250,6 +331,9 @@ def run_all():
         test_flush_runs_even_when_fetch_returns_none,
         test_claim_persists_exact_link_used_by_flush,
         test_pending_alert_delivered_despite_baseline_drift,
+        test_telegram_429_uses_retry_after_not_generic_backoff,
+        test_request_spacing_keeps_burst_within_budget,
+        test_fetch_cheapest_handles_malformed_shapes_without_raising,
     ]
     for test in tests:
         test()

@@ -5,6 +5,7 @@
 ответа не подтверждена официальной документацией — см. README, шаг
 "первый запуск").
 """
+import itertools
 import logging
 import math
 import re
@@ -135,12 +136,31 @@ def fetch_cheapest(route, token, rate_limited_until):
         log.error("%s: не удалось разобрать JSON-ответ Travelpayouts", rid)
         return None
 
+    # REV-025: успешный HTTP-ответ с валидным JSON не гарантирует ожидаемую форму
+    # (например, verhний уровень — список, а не dict, или data — не список dict'ов).
+    # payload.get/item.get на неожиданном типе бросили бы AttributeError, которое
+    # вышло бы из check_route до flush_pending_alerts (шаг 6) — валидируем типы
+    # явно и всегда возвращаем None вместо падения на нераспознанной форме.
+    if not isinstance(payload, dict):
+        log.error("%s: неожиданная форма ответа Travelpayouts (не объект): %s",
+                   rid, type(payload).__name__)
+        return None
+
     data = payload.get("data") or []
+    if not isinstance(data, list):
+        log.error("%s: неожиданная форма поля data в ответе Travelpayouts: %s",
+                   rid, type(data).__name__)
+        return None
     if not data:
         log.info("%s: нет предложений на эти даты", rid)
         return None
 
+    seen_keys = None
     for item in data:
+        if not isinstance(item, dict):
+            continue
+        if seen_keys is None:
+            seen_keys = sorted(item.keys())
         price = item.get("price")
         if price is None:
             price = item.get("value")
@@ -156,7 +176,7 @@ def fetch_cheapest(route, token, rate_limited_until):
     log.error(
         "%s: непустой ответ Travelpayouts, но не распознано поле цены — "
         "возможно, изменилась схема API. Ключи первого элемента: %s",
-        rid, sorted(data[0].keys()),
+        rid, seen_keys,
     )
     return None
 
@@ -240,6 +260,15 @@ def claim_alert(conn, rid, route, entry):
     conn.commit()
 
 
+class TelegramRateLimited(Exception):
+    """429 от Telegram — несёт Retry-After, чтобы flush_pending_alerts мог
+    выставить next_attempt_at по нему, а не по общему backoff (REV-023)."""
+
+    def __init__(self, retry_after_seconds):
+        super().__init__(f"Telegram rate limited, retry_after={retry_after_seconds}")
+        self.retry_after_seconds = retry_after_seconds
+
+
 def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
     currency = route.get("currency", "rub").upper()
     text = (
@@ -260,6 +289,13 @@ def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is
         json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text},
         timeout=config.REQUEST_TIMEOUT_SECONDS,
     )
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after else 60.0
+        except ValueError:
+            delay = 60.0
+        raise TelegramRateLimited(delay)
     if resp.status_code != 200:
         raise requests.HTTPError(f"Telegram sendMessage failed: status={resp.status_code}")
 
@@ -304,7 +340,10 @@ def flush_pending_alerts(conn, route, rid):
             # ConnectionError) содержат полный URL, включая TELEGRAM_BOT_TOKEN в пути
             # (REV-018) — логируем только тип исключения, никогда его текст/traceback.
             attempt_count += 1
-            delay = min(config.POLL_INTERVAL_SECONDS * (2 ** attempt_count), 3600)
+            if isinstance(e, TelegramRateLimited):
+                delay = e.retry_after_seconds  # REV-023: уважаем Retry-After, а не общий backoff
+            else:
+                delay = min(config.POLL_INTERVAL_SECONDS * (2 ** attempt_count), 3600)
             next_at = (now.timestamp() + delay)
             conn.execute(
                 "UPDATE alerts SET attempt_count=?, next_attempt_at=? "
@@ -365,26 +404,49 @@ def compute_effective_interval():
     return effective
 
 
+def compute_request_spacing(interval, n):
+    """Секунд между отдельными запросами внутри цикла (REV-024): n запросов,
+    равномерно распределённых по interval секунд, гарантируют, что бюджет
+    MAX_REQUESTS_PER_MINUTE не превышается всплеском в начале цикла."""
+    if n <= 0:
+        return interval
+    return interval / n
+
+
 def main():
     if not config.TRAVELPAYOUTS_TOKEN or not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         raise SystemExit("Заполните TRAVELPAYOUTS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID в .env")
 
+    if not config.ROUTES:
+        raise SystemExit("ROUTES пуст — нечего опрашивать, проверьте config.py")
+
     conn = init_db(config.DB_PATH)
     interval = compute_effective_interval()
     rate_limited_until = {}
+    n = len(config.ROUTES)
+    # REV-024: N запросов не должны выстреливать пачкой в начале цикла — иначе
+    # средний темп укладывается в бюджет, а мгновенный всплеск — нет. Каждый
+    # маршрут опрашивается раз в `interval` секунд, но сами маршруты внутри
+    # цикла равномерно разнесены по времени, а не выполняются одним блоком.
+    spacing = compute_request_spacing(interval, n)
 
-    log.info("Запуск: %d маршрут(ов), интервал %dс", len(config.ROUTES), interval)
+    log.info("Запуск: %d маршрут(ов), интервал %dс (шаг между запросами %.1fс)", n, interval, spacing)
 
-    while True:
-        for route in config.ROUTES:
-            rid = route_id(route)
-            try:
-                check_route(conn, route, rate_limited_until)
-            except requests.RequestException as e:
-                log.error("%s: ошибка сети/API (%s)", rid, type(e).__name__)
-            except Exception:
-                log.exception("%s: непредвиденная ошибка", rid)
-        time.sleep(interval)
+    next_at = time.monotonic()
+    routes_cycle = itertools.cycle(config.ROUTES)
+    for route in routes_cycle:
+        now = time.monotonic()
+        if next_at > now:
+            time.sleep(next_at - now)
+        next_at += spacing
+
+        rid = route_id(route)
+        try:
+            check_route(conn, route, rate_limited_until)
+        except requests.RequestException as e:
+            log.error("%s: ошибка сети/API (%s)", rid, type(e).__name__)
+        except Exception:
+            log.exception("%s: непредвиденная ошибка", rid)
 
 
 if __name__ == "__main__":
