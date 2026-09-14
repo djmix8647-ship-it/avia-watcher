@@ -182,3 +182,85 @@ finding. 22 findings total were raised and accepted across 5 rounds (0
 rejected) — proceeding to Phase 3 (build), implementation already authorized
 by the original task ("write a working project... README... systemd...
 tested end-to-end").
+
+## Phase 3 — Build (host = builder, per default role)
+
+Base commit for inspection: `0f36e21` (empty baseline, created with user's
+explicit authorization to `git init` + commit locally so a fresh Codex
+session could diff-inspect real code, not just the plan — repo-local git
+identity set for this, not global). Implementation committed as `308d5b0`.
+
+### Inspection attempt 1 — INVALIDATED (host process error, not a code finding)
+
+`inspect --base 0f36e21 ...` with the runner's own stdout redirected to
+`inspect_round1.log` *inside* the inspected repo — the file grew while the
+run was in flight, which changed the tracked/untracked snapshot mid-inspection
+and the runner correctly refused: `"error": "Code changed during inspection;
+inspect the final code again."`, `"status": "failed"`. This is the runtime
+guidance ("keep artifacts outside the target checkout") that the host failed
+to follow on the first attempt — not a defect in avia-watcher.
+
+Despite the invalidated wrapper status, the embedded Codex response was a
+real, evidence-based REVISE with 3 findings (session 01a0a1b5...):
+REV-023 (medium, Telegram 429 Retry-After discarded, generic backoff used
+instead), REV-024 (medium, N route requests fired as an instantaneous burst
+at cycle start rather than paced — average rate within budget, instantaneous
+rate not), REV-025 (medium, a successful-but-malformed JSON shape, e.g. a
+top-level list, would raise AttributeError inside fetch_cheapest, escaping
+check_route before the unconditional flush_pending_alerts step). Host
+accepted all 3, fixed watcher.py (TelegramRateLimited exception carrying
+retry_after; per-route request pacing via compute_request_spacing +
+itertools.cycle in main(); defensive isinstance() validation of payload/data/
+item shapes in fetch_cheapest), added deterministic tests, committed as
+`e772619`.
+
+### Inspection attempt 2 — COMPLETED, REVISE (2 findings)
+
+Rerun with the runner's stdout kept outside the repo (session scratchpad).
+`"status": "completed"`, session 01a0a1ba... Verdict REVISE, 2 new findings
+(did not re-flag REV-023/024/025 — confirms those fixes held up under a
+fresh read): REV-026 (medium, the pacing loop let a slow request's delay
+accumulate — `next_at += spacing` unconditionally meant a one-time backlog
+could still produce a burst of unpaced requests while catching up), REV-027
+(medium, `float(price)` on a non-numeric/NaN/Infinity value would raise and
+escape the same way REV-025 did, just via a different code path — numeric
+parsing rather than shape validation). Host accepted both, fixed watcher.py
+(`next_schedule_time()` rebases from `now` instead of the stale schedule when
+behind; price parsing wrapped in try/except with an `isfinite` check, skips
+to the next item instead of raising), added deterministic tests including a
+pure-function test for the pacing fix, committed as `d5b0091`.
+
+### Inspection attempt 3 — FAILED (external: Codex account usage limit)
+
+`"status": "failed"`, `exit_code: 1`, elapsed 12.5s (no actual review ran).
+Raw Codex CLI output: `"You've hit your usage limit. Upgrade to Plus to
+continue using Codex ..., or try again at Oct 13th, 2026 4:45 PM."` This is
+an account-level quota exhaustion, external to this session and to
+avia-watcher's code — not a code finding, not a process mistake by the host
+this time (artifacts were correctly kept outside the repo).
+
+**STOPPING HERE**: `MAX_INSPECTION_ROUNDS=2` (initial + one after fixes) is
+exhausted by the two *valid* rounds above (attempt 1's invalid wrapper status
+doesn't consume budget by protocol, but its real findings were fixed anyway
+before attempt 2, which is the genuine "initial" content-bearing round;
+attempt 2's fixes make attempt 3 the "after fixes" round the budget allows —
+which then failed for an external reason, not a content reason). Further
+independent Codex inspection is unavailable until the quota resets
+(Oct 13, 2026 per the CLI's own message).
+
+**Host's position**: REV-026 and REV-027 were independently re-traced by the
+host (not just accepted on faith) and are correctly diagnosed, proportionate
+fixes — each has a dedicated deterministic test in `test_watcher.py`
+(`test_pacing_does_not_burst_after_a_slow_request`, and the extended
+malformed-price cases in `test_fetch_cheapest_handles_malformed_shapes_without_raising`)
+that fails without the fix and passes with it. All 13 tests in
+`test_watcher.py` pass (`python test_watcher.py`, exit 0). No further Codex
+confirmation of this specific round was obtained due to the quota limit —
+this is disclosed here rather than implied as approved. The code has NOT
+been independently re-inspected after the REV-026/REV-027 fixes; a fresh
+Codex `inspect` pass after Oct 13, 2026 would be the way to close that gap
+if the user wants it.
+
+25 total findings raised across plan review (22) and code inspection (3
+distinct issues across 2 valid rounds: REV-023/024/025, then REV-026/027),
+all accepted and fixed, 0 rejected. Final commit: `d5b0091`.
