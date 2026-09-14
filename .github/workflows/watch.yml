@@ -48,3 +48,4 @@ jobs:
         with:
           path: prices.db
           key: prices-db-${{ github.run_id }}
+
