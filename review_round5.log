@@ -1,0 +1,75 @@
+{"provider": "codex", "model": "CLI default (unresolved)", "mode": "review", "artifacts": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-wq_1zdbe"}
+{
+  "status": "completed",
+  "mode": "review",
+  "provider": "codex",
+  "roles": {
+    "host": "claude",
+    "planner": "claude",
+    "reviewer": "codex",
+    "builder": "claude",
+    "inspector": "codex"
+  },
+  "repo": "D:\\PROJECTS\\avia-watcher",
+  "plan": "D:\\PROJECTS\\avia-watcher\\PLAN.md",
+  "plan_sha256": "af2b1625f15ade476f25f0b68395ac1733605dd852dacb55cc767159d1d1d87d",
+  "requested_model": null,
+  "requested_effort": null,
+  "base": null,
+  "snapshot": null,
+  "previous": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-oorxnns6\\result.json",
+  "started_at": 1789418730.6766207,
+  "artifacts": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-wq_1zdbe",
+  "cli_version": "codex-cli 0.154.0",
+  "executable": [
+    "D:\\node-v24.20.0-win-x64\\node-v24.20.0-win-x64\\node.EXE",
+    "D:\\node-v24.20.0-win-x64\\node-v24.20.0-win-x64\\node_modules\\@openai\\codex\\bin\\codex.js"
+  ],
+  "exit_code": 0,
+  "session_id": "01a0a199-67ea-7e60-94d5-fc3359ad088f",
+  "response": {
+    "verdict": "REVISE",
+    "summary": "The revised durable outbox is incomplete: pending alerts can be skipped during API failures, and it does not retain the itinerary link required to send the promised ticket link.",
+    "findings": [
+      {
+        "id": "REV-020",
+        "severity": "high",
+        "path": "PLAN.md — `check_route` steps 1 and 6",
+        "evidence": "Step 1 says that when `fetch_cheapest(route)` returns `None` (including network error, 429, empty response, or route backoff), `check_route` exits. Step 6 simultaneously says `flush_pending_alerts` runs unconditionally every cycle. These are incompatible: a pending Telegram alert is not retried while Travelpayouts is unavailable or the route is rate-limited, even if Telegram has recovered. For example, a failed Telegram alert remains pending, then the next API call receives 429; the stated step-1 return prevents the promised flush.",
+        "fix": "Make pending-outbox flushing independent of fetching and anomaly detection: invoke it even when the route is skipped or `fetch_cheapest` returns `None`, and define the exact order in `check_route`."
+      },
+      {
+        "id": "REV-021",
+        "severity": "high",
+        "path": "PLAN.md — `alerts` schema and `flush_pending_alerts`",
+        "evidence": "The planned `alerts` row stores only `route_id`, `price`, `depart_date`, `return_date`, status, and creation time. `flush_pending_alerts` rebuilds the message from those stored fields rather than the current API entry, but neither the API `link` nor the `is_itinerary_specific` result is persisted. Consequently, the delivery path cannot include the detected ticket-specific URL; it must fall back to a generic route search, including on the first alert because delivery was moved from claim to flush.",
+        "fix": "At claim time, build and persist an immutable alert payload, at minimum `purchase_url`, `is_itinerary_specific`, and the display fields needed for the message. Flush that stored payload, not a reconstructed one based only on the route and dates."
+      },
+      {
+        "id": "REV-022",
+        "severity": "medium",
+        "path": "PLAN.md — `flush_pending_alerts` retry policy / Telegram error handling",
+        "evidence": "Every pending alert is attempted on every cycle with no persisted `next_attempt_at`, attempt count, expiry, or handling of Telegram HTTP 429. A blocked bot, invalid chat ID, or Telegram rate limit produces a request and log entry every 20 seconds indefinitely. If delivery later resumes after a long outage, the daemon can send alerts for tickets whose cached offer has expired; the planned rows do not retain a discovery timestamp or expiry policy.",
+        "fix": "Persist retry metadata and honor Telegram `Retry-After` with capped exponential backoff. Store the alert creation/discovery time and define a stale-alert expiry policy; report expired pending rows rather than sending obsolete ticket alerts."
+      }
+    ],
+    "coverage": [
+      "Verified `PLAN.md` SHA-256: `af2b1625f15ade476f25f0b68395ac1733605dd852dacb55cc767159d1d1d87d`.",
+      "Inspected the repository inventory and review/disposition artifacts; no implementation, configuration, tests, or database files currently exist.",
+      "Traced the revised shared-state plan for `alerts`, including claim, pending-row persistence, route skip paths, and flush delivery behavior."
+    ],
+    "limitations": [
+      "This is a plan-only review; concrete control flow, SQL constraints, logging behavior, and test implementation cannot be verified until source files exist.",
+      "No files were edited, tests were run, or work was delegated."
+    ]
+  },
+  "usage": {
+    "input_tokens": 756592,
+    "cached_input_tokens": 642560,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 12879,
+    "reasoning_output_tokens": 7144
+  },
+  "observed_models": [],
+  "elapsed_seconds": 56.84
+}

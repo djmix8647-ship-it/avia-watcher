@@ -1,0 +1,96 @@
+{"provider": "codex", "model": "CLI default (unresolved)", "mode": "review", "artifacts": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-x6qkjj_l"}
+{
+  "status": "completed",
+  "mode": "review",
+  "provider": "codex",
+  "roles": {
+    "host": "claude",
+    "planner": "claude",
+    "reviewer": "codex",
+    "builder": "claude",
+    "inspector": "codex"
+  },
+  "repo": "D:\\PROJECTS\\avia-watcher",
+  "plan": "D:\\PROJECTS\\avia-watcher\\PLAN.md",
+  "plan_sha256": "6730c49126e051653c7f1d0c988251b74967ed3d1e40ce401e40ec148e4380c6",
+  "requested_model": null,
+  "requested_effort": null,
+  "base": null,
+  "snapshot": null,
+  "previous": null,
+  "started_at": 1789417575.4454317,
+  "artifacts": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-x6qkjj_l",
+  "cli_version": "codex-cli 0.154.0",
+  "executable": [
+    "D:\\node-v24.20.0-win-x64\\node-v24.20.0-win-x64\\node.EXE",
+    "D:\\node-v24.20.0-win-x64\\node-v24.20.0-win-x64\\node_modules\\@openai\\codex\\bin\\codex.js"
+  ],
+  "exit_code": 0,
+  "session_id": "01a0a199-67ea-7e60-94d5-fc3359ad088f",
+  "response": {
+    "verdict": "REVISE",
+    "summary": "The plan hash matches the supplied SHA-256, but the implementation plan has material API-selection, configuration-fidelity, and alert-deduplication defects.",
+    "findings": [
+      {
+        "id": "REV-001",
+        "severity": "high",
+        "path": "PLAN.md — “Источник данных” / `fetch_cheapest`",
+        "evidence": "The plan rejects `aviasales/v3/prices_for_dates` as nonexistent and chooses `/v2/prices/latest`. Current official Travelpayouts Data API documentation lists `/aviasales/v3/prices_for_dates`, explicitly recommends it instead of `/v2/prices/latest`, limits results to tickets found in the last 48 hours, and returns a route/date-specific `link`. The selected cached endpoint therefore conflicts with the claimed research and unnecessarily cannot provide the specified ticket-search link.",
+        "fix": "Use `/aviasales/v3/prices_for_dates` with each route’s departure/return constraints and consume its returned link; revise the documented API rationale and response parsing accordingly."
+      },
+      {
+        "id": "REV-002",
+        "severity": "high",
+        "path": "PLAN.md — `config.py` ROUTES and `fetch_cheapest` query parameters",
+        "evidence": "A route has `one_way` and `currency`, but the specified `/v2/prices/latest` request includes only origin, destination, period_type, beginning_of_period, sorting, and show_to_affiliates. Thus a configured round-trip route can be fetched as the endpoint default (one-way), and a configured non-default currency can silently be stored and alerted in the API default currency. Both make the route configuration and price comparison incorrect.",
+        "fix": "Specify and implement propagation of `one_way` and `currency` for every request, validate accepted values, and include both in the stable route identity so histories of different trip types/currencies never mix."
+      },
+      {
+        "id": "REV-003",
+        "severity": "high",
+        "path": "PLAN.md — `check_route`, `record_price`, and alert behavior",
+        "evidence": "No alert state, uniqueness key, cooldown, or post-send persistence is planned. A low cached fare returned unchanged by the API on consecutive 20-second polls remains below the median and will produce a Telegram alert every cycle, potentially indefinitely. The shared SQLite `prices` table only stores observations, so process restart also cannot suppress already-alerted fares.",
+        "fix": "Add durable alert state keyed by route configuration plus fare/date/link (or a defined cooldown), write it transactionally only after a successful send, and avoid repeated observations/alerts for an unchanged API record."
+      },
+      {
+        "id": "REV-004",
+        "severity": "medium",
+        "path": "PLAN.md — acceptance criterion 3 and Verification step 3",
+        "evidence": "Setting `ANOMALY_THRESHOLD=0.95` does not guarantee an alert within one poll: the criterion itself requires at least `MIN_HISTORY_SAMPLES` prior observations, and an unchanged cached cheapest price equals its rolling median rather than being below 95% of it. The manual verification text later says to wait five cycles, contradicting the one-cycle acceptance criterion, and still does not ensure a lower next price.",
+        "fix": "Replace this with a deterministic fixture/mocked response test that seeds history and supplies a lower price; describe the real-token check as observational rather than a guaranteed acceptance test."
+      },
+      {
+        "id": "REV-005",
+        "severity": "medium",
+        "path": "PLAN.md — `main()` polling all routes",
+        "evidence": "The plan sets a 20-second interval but gives no route-count limit, pacing, or handling policy for HTTP 429. `/v2/prices/latest` is limited to 300 requests/minute; more than 100 routes produces over 300 requests/minute before retries. Retrying 429 once per cycle can keep the service rate-limited and leave routes unobserved.",
+        "fix": "Enforce a safe maximum configured route count or schedule requests with rate limiting; treat 429/Retry-After as a per-endpoint backoff and log skipped/deferred routes."
+      },
+      {
+        "id": "REV-006",
+        "severity": "medium",
+        "path": "PLAN.md — `fetch_cheapest` / `build_purchase_link`",
+        "evidence": "The plan records the first cheapest cached response without specifying filtering on its `actual` field, even though that field is identified in the planned response schema. It also constructs a generic origin/destination page that omits the alert’s departure and return dates. A stale/unavailable record can therefore trigger an alert whose link does not reproduce the notified itinerary.",
+        "fix": "Define and implement eligibility checks, including the intended interpretation of `actual`, and use the API-provided itinerary link where available or build a documented date-aware search URL from the selected record."
+      }
+    ],
+    "coverage": [
+      "Verified `PLAN.md` SHA-256 against the supplied value.",
+      "Inspected all repository files present: `PLAN.md`, `PLAN-REVIEW-LOG.md`, and `review_round1.log`; the repository is otherwise greenfield, with no existing watcher/config/database writers or callers to trace.",
+      "Checked current official Travelpayouts API documentation and rate-limit documentation relevant to the selected endpoint and its claimed replacement."
+    ],
+    "limitations": [
+      "No implementation files, tests, configuration, or SQLite schema exist yet, so runtime behavior and exact shared-state call paths cannot be inspected.",
+      "Per instruction, no files were edited, tests were run, or work was delegated."
+    ]
+  },
+  "usage": {
+    "input_tokens": 89993,
+    "cached_input_tokens": 67584,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2234,
+    "reasoning_output_tokens": 859
+  },
+  "observed_models": [],
+  "elapsed_seconds": 65.77
+}

@@ -1,0 +1,75 @@
+{"provider": "codex", "model": "CLI default (unresolved)", "mode": "review", "artifacts": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-oorxnns6"}
+{
+  "status": "completed",
+  "mode": "review",
+  "provider": "codex",
+  "roles": {
+    "host": "claude",
+    "planner": "claude",
+    "reviewer": "codex",
+    "builder": "claude",
+    "inspector": "codex"
+  },
+  "repo": "D:\\PROJECTS\\avia-watcher",
+  "plan": "D:\\PROJECTS\\avia-watcher\\PLAN.md",
+  "plan_sha256": "be4066008412f99b59e8eed0dd4c6d0b28aa1ff2e21eb61ecbc6e081322dfebf",
+  "requested_model": null,
+  "requested_effort": null,
+  "base": null,
+  "snapshot": null,
+  "previous": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-_42a8pq3\\result.json",
+  "started_at": 1789418466.0402062,
+  "artifacts": "C:\\Users\\UNUSUA~1\\AppData\\Local\\Temp\\claudex-oorxnns6",
+  "cli_version": "codex-cli 0.154.0",
+  "executable": [
+    "D:\\node-v24.20.0-win-x64\\node-v24.20.0-win-x64\\node.EXE",
+    "D:\\node-v24.20.0-win-x64\\node-v24.20.0-win-x64\\node_modules\\@openai\\codex\\bin\\codex.js"
+  ],
+  "exit_code": 0,
+  "session_id": "01a0a199-67ea-7e60-94d5-fc3359ad088f",
+  "response": {
+    "verdict": "REVISE",
+    "summary": "The revision handles many prior cases, but failed pending alerts can still be abandoned, and the planned error logging can expose both API secrets.",
+    "findings": [
+      {
+        "id": "REV-017",
+        "severity": "high",
+        "path": "PLAN.md — `check_route` order and “Дедупликация и порядок доставки”",
+        "evidence": "A `pending` alert is retried only inside the fresh-anomaly branch; there is no independent pending-alert retry worker. If Telegram fails for a low fare, step 5 records that low price. With `HISTORY_WINDOW=5`, prior prices `[100,100,100,100,100]`, candidate `40`, and threshold `0.5`, retries initially occur. After repeated failed observations, the rolling history becomes `[100,100,40,40,40]`, median is `40`, so `40 < 0.5 * 40` is false. The row remains `pending` permanently and no message is sent, despite the plan saying pending sends retry naturally.",
+        "fix": "Process durable `pending` alerts independently of a new anomaly decision, using a persisted payload and retry policy. Alternatively, define a pending row as a separate retryable outbox item and prevent fresh baseline changes from deciding whether it is retried."
+      },
+      {
+        "id": "REV-018",
+        "severity": "high",
+        "path": "PLAN.md — token transport and network/API error logging",
+        "evidence": "Travelpayouts token is planned as a request parameter, and the Telegram bot token is necessarily embedded in the Bot API URL. The plan logs network/API errors but requires no redaction. A 401/429 handled through `requests.raise_for_status()` produces an `HTTPError` whose message contains the request URL; logging that exception can write either token into systemd/journal logs, defeating the `.env` secret-handling requirement.",
+        "fix": "Never log raw request URLs or exception strings that may embed them. Redact query parameter values and `/bot<TOKEN>/` path segments before logging; keep structured logs to status code, host, route ID, and sanitized error category. Add a deterministic redaction test."
+      },
+      {
+        "id": "REV-019",
+        "severity": "medium",
+        "path": "PLAN.md — `build_purchase_link` fallback",
+        "evidence": "When an entry has a valid price but lacks a usable `link`, the fallback URL contains only marker, origin, destination, and locale. It omits the alerted departure and return dates, so clicking it opens a generic route search rather than the itinerary whose price/date was sent. This fails the stated goal of a ticket link for the alerted fare in exactly the documented fallback case.",
+        "fix": "Generate a documented date-aware Aviasales search URL from `depart_date`/`return_date`, or mark the alert as lacking a purchase link rather than presenting a generic route page as one."
+      }
+    ],
+    "coverage": [
+      "Verified `PLAN.md` SHA-256: `be4066008412f99b59e8eed0dd4c6d0b28aa1ff2e21eb61ecbc6e081322dfebf`.",
+      "Inspected the repository inventory and all available review/disposition artifacts; no implementation, configuration, tests, or database files exist.",
+      "Traced the revised planned `prices`/`alerts` flow, including pending/sent transitions, local Telegram-send error handling, and the subsequent baseline update."
+    ],
+    "limitations": [
+      "This is a plan-only review; concrete logging calls, request construction, SQL schema constraints, and actual retry behavior cannot be inspected before implementation exists.",
+      "No files were edited, tests were run, or work was delegated."
+    ]
+  },
+  "usage": {
+    "input_tokens": 498779,
+    "cached_input_tokens": 404736,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 11063,
+    "reasoning_output_tokens": 6321
+  },
+  "observed_models": [],
+  "elapsed_seconds": 57.6
+}
