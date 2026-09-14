@@ -11,6 +11,7 @@ import math
 import re
 import sqlite3
 import statistics
+import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -469,5 +470,35 @@ def main():
             log.exception("%s: непредвиденная ошибка", rid)
 
 
+def run_once():
+    """Один проход по всем маршрутам и выход — для планировщиков вроде GitHub
+    Actions, которые сами берут на себя периодичность (cron), в отличие от
+    main(), которая держит собственный бесконечный цикл для VPS/systemd."""
+    if not config.TRAVELPAYOUTS_TOKEN or not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        raise SystemExit("Заполните TRAVELPAYOUTS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (.env или секреты)")
+    if not config.ROUTES:
+        raise SystemExit("ROUTES пуст — нечего опрашивать, проверьте config.py")
+
+    conn = init_db(config.DB_PATH)
+    rate_limited_until = {}
+    log.info("Разовый запуск: %d маршрут(ов)", len(config.ROUTES))
+
+    for i, route in enumerate(config.ROUTES):
+        if i > 0:
+            time.sleep(1)  # небольшой разнос запросов, без сложной пейсинг-математики main()
+        rid = route_id(route)
+        try:
+            check_route(conn, route, rate_limited_until)
+        except requests.RequestException as e:
+            log.error("%s: ошибка сети/API (%s)", rid, type(e).__name__)
+        except Exception:
+            log.exception("%s: непредвиденная ошибка", rid)
+
+    conn.close()
+
+
 if __name__ == "__main__":
-    main()
+    if "--once" in sys.argv:
+        run_once()
+    else:
+        main()
