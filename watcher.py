@@ -88,7 +88,7 @@ def init_db(path):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             origin TEXT NOT NULL,
             destination TEXT NOT NULL,
-            departure_at TEXT NOT NULL,
+            departure_at TEXT,
             return_at TEXT,
             one_way INTEGER NOT NULL,
             currency TEXT NOT NULL,
@@ -102,7 +102,42 @@ def init_db(path):
         )"""
     )
     conn.commit()
+    _ensure_routes_departure_at_nullable(conn)
     return conn
+
+
+def _ensure_routes_departure_at_nullable(conn):
+    """Уже задеплоенный prices.db (кэш GitHub Actions) мог быть создан до
+    появления auto-режима, когда routes.departure_at был NOT NULL —
+    CREATE TABLE IF NOT EXISTS не меняет схему существующей таблицы, а
+    SQLite не умеет ALTER COLUMN DROP NOT NULL напрямую, поэтому таблицу
+    приходится пересоздать с переносом данных."""
+    cols = conn.execute("PRAGMA table_info(routes)").fetchall()
+    departure_at_col = next((c for c in cols if c[1] == "departure_at"), None)
+    if departure_at_col is None or departure_at_col[3] == 0:  # notnull=0 -> уже nullable
+        return
+    conn.execute("ALTER TABLE routes RENAME TO routes_old")
+    conn.execute(
+        """CREATE TABLE routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origin TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            departure_at TEXT,
+            return_at TEXT,
+            one_way INTEGER NOT NULL,
+            currency TEXT NOT NULL,
+            added_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO routes (id, origin, destination, departure_at, return_at, "
+        "one_way, currency, added_at) "
+        "SELECT id, origin, destination, departure_at, return_at, one_way, currency, added_at "
+        "FROM routes_old"
+    )
+    conn.execute("DROP TABLE routes_old")
+    conn.commit()
+    log.info("Миграция схемы БД: routes.departure_at стал nullable (auto-режим)")
 
 
 def seed_routes_if_empty(conn):
@@ -117,7 +152,7 @@ def seed_routes_if_empty(conn):
             "INSERT INTO routes (origin, destination, departure_at, return_at, "
             "one_way, currency, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
-                route["origin"], route["destination"], route["departure_at"],
+                route["origin"], route["destination"], route.get("departure_at"),
                 route.get("return_at"), int(bool(route.get("one_way", True))),
                 route.get("currency", "rub"), datetime.now(timezone.utc).isoformat(),
             ),
@@ -125,6 +160,38 @@ def seed_routes_if_empty(conn):
     conn.commit()
     if config.ROUTES:
         log.info("Засеяно %d маршрут(ов) из config.py в БД", len(config.ROUTES))
+
+
+def migrate_routes_to_auto_dates(conn):
+    """Одноразовая миграция: маршруты, засеянные до появления auto-режима (с
+    зафиксированным месяцем из старой версии config.py), переводятся на
+    скользящее окно "от сегодня" — именно так теперь по умолчанию ведёт себя
+    /add без даты. Без этого уже засеянные маршруты навсегда остались бы
+    привязаны к месяцу, в который были впервые запущены."""
+    if _get_bot_state(conn, "migrated_auto_dates"):
+        return
+    conn.execute("UPDATE routes SET departure_at = NULL, return_at = NULL, one_way = 1")
+    conn.commit()
+    _set_bot_state(conn, "migrated_auto_dates", "1")
+
+
+def expand_route_to_checks(route):
+    """Маршрут без фиксированной даты (departure_at IS NULL, обычный случай
+    для /add без даты) разворачивается в MONTHS_AHEAD проверок — текущий
+    месяц и следующие. Пересчитывается заново на каждом прогоне, так что
+    окно поиска всегда "от сегодня вперёд", а не застывает на месяце, в
+    который маршрут был добавлен. Маршрут с явно заданной датой (через
+    /add ORIGIN DEST YYYY-MM) возвращается как есть — ровно одна проверка."""
+    if route.get("departure_at"):
+        return [route]
+    today = datetime.now(timezone.utc)
+    checks = []
+    for i in range(config.MONTHS_AHEAD):
+        month_index = today.month - 1 + i
+        year = today.year + month_index // 12
+        month = month_index % 12 + 1
+        checks.append({**route, "departure_at": f"{year:04d}-{month:02d}"})
+    return checks
 
 
 def get_active_routes(conn):
@@ -146,12 +213,15 @@ _IATA_RE = re.compile(r"^[A-Za-z]{3}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}(-\d{2})?$")
 
 
-def add_route_db(conn, origin, destination, departure_at, return_at=None, currency=None):
+def add_route_db(conn, origin, destination, departure_at=None, return_at=None, currency=None):
+    """departure_at=None (по умолчанию) — маршрут мониторится в скользящем
+    окне "от сегодня" (см. expand_route_to_checks), а не на фиксированный
+    месяц. Указав departure_at явно, можно добавить проверку конкретной даты."""
     origin = (origin or "").upper()
     destination = (destination or "").upper()
     if not _IATA_RE.match(origin) or not _IATA_RE.match(destination):
         raise ValueError("IATA-код города — 3 латинские буквы (например NAL, MOW)")
-    if not _DATE_RE.match(departure_at or ""):
+    if departure_at and not _DATE_RE.match(departure_at):
         raise ValueError("дата вылета в формате YYYY-MM или YYYY-MM-DD")
     if return_at and not _DATE_RE.match(return_at):
         raise ValueError("дата обратно в формате YYYY-MM или YYYY-MM-DD")
@@ -176,12 +246,16 @@ def remove_route_db(conn, db_id):
 def format_routes_list(conn):
     routes = get_active_routes(conn)
     if not routes:
-        return "Маршруты не настроены. Добавьте: /add ORIGIN DEST YYYY-MM"
+        return "Маршруты не настроены. Добавьте: /add ORIGIN DEST"
     lines = ["Текущие маршруты:"]
     for r in routes:
-        line = f"{r['db_id']}. {r['origin']} → {r['destination']}, вылет {r['departure_at']}"
-        if r["return_at"]:
-            line += f", обратно {r['return_at']}"
+        line = f"{r['db_id']}. {r['origin']} → {r['destination']}"
+        if r["departure_at"]:
+            line += f", вылет {r['departure_at']}"
+            if r["return_at"]:
+                line += f", обратно {r['return_at']}"
+        else:
+            line += f", авто (текущий месяц + {config.MONTHS_AHEAD - 1} след.)"
         line += f" ({r['currency'].upper()})"
         lines.append(line)
     return "\n".join(lines)
@@ -396,8 +470,11 @@ def _telegram_call(method, payload):
     return resp.json()
 
 
-def send_telegram_text(text, chat_id=None):
-    _telegram_call("sendMessage", {"chat_id": chat_id or config.TELEGRAM_CHAT_ID, "text": text})
+def send_telegram_text(text, chat_id=None, reply_markup=None):
+    payload = {"chat_id": chat_id or config.TELEGRAM_CHAT_ID, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    _telegram_call("sendMessage", payload)
 
 
 def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
@@ -413,46 +490,77 @@ def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is
     text += f"\n{purchase_url}"
     if not is_itinerary_specific:
         text += "\n(ссылка — общий поиск по маршруту без предустановленных дат, уточните даты на сайте)"
+    # Надёжного единого официального источника актуальных промокодов не нашлось
+    # (см. обсуждение) — не выдумываем конкретный код/сайт, только напоминаем
+    # проверить на самой странице оформления по ссылке выше.
+    text += "\n\U0001F4B3 Проверьте промокод на странице оформления по ссылке выше — иногда даёт доп. скидку"
     send_telegram_text(text)
 
 
 HELP_TEXT = (
     "Команды avia-watcher:\n"
-    "/list — список маршрутов\n"
-    "/add ORIGIN DEST YYYY-MM [YYYY-MM] — добавить маршрут "
-    "(вторая дата опциональна — обратный билет; без неё — только туда)\n"
+    "/list — список маршрутов (с кнопками удаления)\n"
+    "/add ORIGIN DEST [YYYY-MM [YYYY-MM]] — добавить маршрут. Без дат — "
+    "скользящее окно от сегодня (авто, рекомендуется); с одной датой — "
+    "только она; с двумя — туда-обратно\n"
     "/remove N — удалить маршрут по номеру из /list\n"
     "/help — эта подсказка"
 )
 
+# Постоянная клавиатура для действий без параметров — нажатие шлёт текст
+# кнопки как обычное сообщение, поэтому он же служит ключом сопоставления.
+MAIN_KEYBOARD = {
+    "keyboard": [[{"text": "📋 Список"}, {"text": "❓ Помощь"}]],
+    "resize_keyboard": True,
+}
+_BUTTON_TEXT_TO_COMMAND = {"📋 Список": "/list", "❓ Помощь": "/help"}
+
+
+def routes_inline_keyboard(conn):
+    """Инлайн-кнопки удаления под сообщением /list — не нужно помнить и
+    печатать номер маршрута для /remove."""
+    routes = get_active_routes(conn)
+    if not routes:
+        return None
+    return {
+        "inline_keyboard": [
+            [{"text": f"🗑 Удалить #{r['db_id']} ({r['origin']}→{r['destination']})",
+              "callback_data": f"remove:{r['db_id']}"}]
+            for r in routes
+        ]
+    }
+
 
 def _handle_command(conn, text):
-    parts = text.strip().split()
+    """Возвращает (текст_ответа, reply_markup|None)."""
+    stripped = text.strip()
+    parts = stripped.split()
     if not parts:
-        return None
-    cmd = parts[0].lower().split("@")[0]  # /add@имя_бота -> /add
+        return None, None
+    cmd = _BUTTON_TEXT_TO_COMMAND.get(stripped, parts[0].lower().split("@")[0])  # /add@bot -> /add
 
     if cmd in ("/start", "/help"):
-        return HELP_TEXT
+        return HELP_TEXT, MAIN_KEYBOARD
     if cmd == "/list":
-        return format_routes_list(conn)
+        return format_routes_list(conn), routes_inline_keyboard(conn)
     if cmd == "/add":
-        if len(parts) < 4:
-            return "Формат: /add ORIGIN DEST YYYY-MM [YYYY-MM]"
+        if len(parts) < 3:
+            return "Формат: /add ORIGIN DEST [YYYY-MM [YYYY-MM]]", None
+        departure_at = parts[3] if len(parts) > 3 else None
         return_at = parts[4] if len(parts) > 4 else None
         try:
-            new_id = add_route_db(conn, parts[1], parts[2], parts[3], return_at)
+            new_id = add_route_db(conn, parts[1], parts[2], departure_at, return_at)
         except ValueError as e:
-            return f"Ошибка: {e}"
-        return f"Добавлено: #{new_id}\n\n{format_routes_list(conn)}"
+            return f"Ошибка: {e}", None
+        return f"Добавлено: #{new_id}\n\n{format_routes_list(conn)}", routes_inline_keyboard(conn)
     if cmd == "/remove":
         if len(parts) < 2 or not parts[1].isdigit():
-            return "Формат: /remove N (номер из /list)"
+            return "Формат: /remove N (номер из /list)", None
         ok = remove_route_db(conn, int(parts[1]))
         if not ok:
-            return f"Маршрут #{parts[1]} не найден"
-        return f"Удалено: #{parts[1]}\n\n{format_routes_list(conn)}"
-    return f"Неизвестная команда: {parts[0]}\n\n{HELP_TEXT}"
+            return f"Маршрут #{parts[1]} не найден", None
+        return f"Удалено: #{parts[1]}\n\n{format_routes_list(conn)}", routes_inline_keyboard(conn)
+    return f"Неизвестная команда: {parts[0]}\n\n{HELP_TEXT}", MAIN_KEYBOARD
 
 
 def _get_bot_state(conn, key, default=None):
@@ -486,20 +594,55 @@ def process_telegram_commands(conn):
 
     for update in updates:
         max_seen = max(max_seen, update.get("update_id", max_seen))
+
+        callback = update.get("callback_query")
+        if callback:
+            _handle_callback_query(conn, callback, allowed_chat_id)
+            continue
+
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         text = message.get("text")
         if not text or str(chat.get("id")) != allowed_chat_id:
             continue  # чужой чат — молча игнорируем, offset всё равно продвигаем
-        reply = _handle_command(conn, text)
-        if reply:
+        reply_text, reply_markup = _handle_command(conn, text)
+        if reply_text:
             try:
-                send_telegram_text(reply)
+                send_telegram_text(reply_text, reply_markup=reply_markup)
             except Exception as e:
                 log.error("Не удалось ответить на команду в Telegram (%s)", type(e).__name__)
 
     if max_seen > last_id:
         _set_bot_state(conn, "last_update_id", max_seen)
+
+
+def _handle_callback_query(conn, callback, allowed_chat_id):
+    """Инлайн-кнопка "🗑 Удалить #N" под /list. answerCallbackQuery обязателен
+    (иначе кнопка в клиенте Telegram виснет с крутилкой до таймаута)."""
+    chat = ((callback.get("message") or {}).get("chat") or {})
+    if str(chat.get("id")) != allowed_chat_id:
+        return
+
+    data = callback.get("data") or ""
+    toast = "Готово"
+    reply_text = None
+    if data.startswith("remove:") and data[len("remove:"):].isdigit():
+        removed_id = int(data[len("remove:"):])
+        ok = remove_route_db(conn, removed_id)
+        toast = f"Удалено #{removed_id}" if ok else f"Маршрут #{removed_id} не найден"
+        reply_text = toast
+
+    try:
+        _telegram_call("answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": toast})
+    except Exception as e:
+        log.error("Не удалось ответить на нажатие кнопки в Telegram (%s)", type(e).__name__)
+
+    if reply_text:
+        try:
+            send_telegram_text(f"{reply_text}\n\n{format_routes_list(conn)}",
+                                reply_markup=routes_inline_keyboard(conn))
+        except Exception as e:
+            log.error("Не удалось отправить подтверждение в Telegram (%s)", type(e).__name__)
 
 
 def flush_pending_alerts(conn, route, rid):
@@ -636,6 +779,7 @@ def main():
     _require_tokens()
     conn = init_db(config.DB_PATH)
     seed_routes_if_empty(conn)
+    migrate_routes_to_auto_dates(conn)
     rate_limited_until = {}
     log.info("Запуск (демон): опрашиваю маршруты из БД, базовый интервал %dс", config.POLL_INTERVAL_SECONDS)
 
@@ -647,7 +791,12 @@ def main():
             time.sleep(config.POLL_INTERVAL_SECONDS)
             continue
 
-        n = len(routes)
+        # Маршрут без даты (auto) разворачивается в несколько проверок —
+        # текущий месяц и следующие (expand_route_to_checks) — "мониторинг
+        # от сегодня" пересчитывается на каждый проход, а не один раз.
+        checks = [c for route in routes for c in expand_route_to_checks(route)]
+
+        n = len(checks)
         interval = compute_effective_interval(n)
         # REV-024: N запросов не должны выстреливать пачкой — каждый маршрут
         # опрашивается раз в `interval` секунд, но сами запросы внутри одного
@@ -655,7 +804,7 @@ def main():
         spacing = compute_request_spacing(interval, n)
         next_at = time.monotonic()
 
-        for route in routes:
+        for route in checks:
             now = time.monotonic()
             if next_at > now:
                 time.sleep(next_at - now)
@@ -677,6 +826,7 @@ def run_once():
     _require_tokens()
     conn = init_db(config.DB_PATH)
     seed_routes_if_empty(conn)
+    migrate_routes_to_auto_dates(conn)
     process_telegram_commands(conn)
 
     routes = get_active_routes(conn)
@@ -685,10 +835,11 @@ def run_once():
         conn.close()
         return
 
+    checks = [c for route in routes for c in expand_route_to_checks(route)]
     rate_limited_until = {}
-    log.info("Разовый запуск: %d маршрут(ов)", len(routes))
+    log.info("Разовый запуск: %d маршрут(ов) -> %d проверок", len(routes), len(checks))
 
-    for i, route in enumerate(routes):
+    for i, route in enumerate(checks):
         if i > 0:
             time.sleep(1)  # небольшой разнос запросов, без сложной пейсинг-математики main()
         rid = route_id(route)

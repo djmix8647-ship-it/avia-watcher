@@ -360,12 +360,12 @@ def test_pacing_does_not_burst_after_a_slow_request():
 
 def test_add_remove_list_routes():
     conn = watcher.init_db(":memory:")
-    assert watcher.format_routes_list(conn) == "Маршруты не настроены. Добавьте: /add ORIGIN DEST YYYY-MM"
+    assert watcher.format_routes_list(conn) == "Маршруты не настроены. Добавьте: /add ORIGIN DEST"
 
-    rid1 = watcher.add_route_db(conn, "nal", "mow", "2026-11")
+    rid1 = watcher.add_route_db(conn, "nal", "mow")  # без даты — auto-режим
     routes = watcher.get_active_routes(conn)
     assert len(routes) == 1
-    assert routes[0]["origin"] == "NAL" and routes[0]["one_way"] is True
+    assert routes[0]["origin"] == "NAL" and routes[0]["departure_at"] is None
 
     rid2 = watcher.add_route_db(conn, "led", "aer", "2026-12", "2026-12-20")
     routes = watcher.get_active_routes(conn)
@@ -386,6 +386,38 @@ def test_add_remove_list_routes():
     assert len(routes) == 1 and routes[0]["db_id"] == rid2
 
 
+def test_expand_route_to_checks_rolling_window_from_today():
+    route = {"origin": "NAL", "destination": "MOW", "departure_at": None, "currency": "rub"}
+    checks = watcher.expand_route_to_checks(route)
+    assert len(checks) == config.MONTHS_AHEAD
+
+    today = datetime.now()
+    expected_first = f"{today.year:04d}-{today.month:02d}"
+    assert checks[0]["departure_at"] == expected_first, "первый месяц окна обязан быть текущим"
+    assert len({c["departure_at"] for c in checks}) == config.MONTHS_AHEAD, "месяцы не должны повторяться"
+
+    # маршрут с фиксированной датой не разворачивается — ровно одна проверка
+    fixed = {"origin": "NAL", "destination": "MOW", "departure_at": "2026-12", "currency": "rub"}
+    assert watcher.expand_route_to_checks(fixed) == [fixed]
+
+
+def test_migrate_routes_to_auto_dates_runs_once():
+    conn = watcher.init_db(":memory:")
+    watcher.add_route_db(conn, "nal", "mow", "2026-11")  # как будто из старого config.py
+    assert watcher.get_active_routes(conn)[0]["departure_at"] == "2026-11"
+
+    watcher.migrate_routes_to_auto_dates(conn)
+    assert watcher.get_active_routes(conn)[0]["departure_at"] is None
+
+    # после миграции пользователь снова ставит фиксированную дату — повторный
+    # вызов migrate не должен затирать её обратно в None
+    rid = watcher.get_active_routes(conn)[0]["db_id"]
+    conn.execute("UPDATE routes SET departure_at = '2027-01' WHERE id = ?", (rid,))
+    conn.commit()
+    watcher.migrate_routes_to_auto_dates(conn)
+    assert watcher.get_active_routes(conn)[0]["departure_at"] == "2027-01"
+
+
 def test_seed_routes_if_empty_seeds_once():
     conn = watcher.init_db(":memory:")
     watcher.seed_routes_if_empty(conn)
@@ -398,21 +430,80 @@ def test_seed_routes_if_empty_seeds_once():
 
 def test_handle_command_dispatch():
     conn = watcher.init_db(":memory:")
-    assert "Команды avia-watcher" in watcher._handle_command(conn, "/help")
-    assert "не настроены" in watcher._handle_command(conn, "/list")
 
-    reply = watcher._handle_command(conn, "/add nal mow 2026-11")
-    assert reply.startswith("Добавлено: #1")
-    assert "NAL" in watcher._handle_command(conn, "/list")
+    text, markup = watcher._handle_command(conn, "/help")
+    assert "Команды avia-watcher" in text and markup == watcher.MAIN_KEYBOARD
 
-    assert "Ошибка" in watcher._handle_command(conn, "/add ZZ mow 2026-11")
+    text, _ = watcher._handle_command(conn, "/list")
+    assert "не настроены" in text
 
-    reply = watcher._handle_command(conn, "/remove 1")
-    assert reply.startswith("Удалено: #1")
-    assert "не настроены" in watcher._handle_command(conn, "/list")
+    # без дат — auto-режим (скользящее окно), не требует YYYY-MM
+    text, markup = watcher._handle_command(conn, "/add nal mow")
+    assert text.startswith("Добавлено: #1")
+    assert markup is not None and markup["inline_keyboard"]
 
-    assert "не найден" in watcher._handle_command(conn, "/remove 999")
-    assert "Неизвестная команда" in watcher._handle_command(conn, "/unknown")
+    # с фиксированной датой — тоже работает, отдельным маршрутом
+    text, _ = watcher._handle_command(conn, "/add led aer 2026-12")
+    assert text.startswith("Добавлено: #2")
+
+    text, _ = watcher._handle_command(conn, "/add ZZ mow")
+    assert "Ошибка" in text
+
+    text, markup = watcher._handle_command(conn, "/remove 1")
+    assert text.startswith("Удалено: #1")
+    assert markup is not None  # маршрут #2 остался
+
+    text, _ = watcher._handle_command(conn, "/remove 999")
+    assert "не найден" in text
+
+    text, markup = watcher._handle_command(conn, "/unknown")
+    assert "Неизвестная команда" in text and markup == watcher.MAIN_KEYBOARD
+
+    # кнопки постоянной клавиатуры работают как соответствующие команды
+    text, _ = watcher._handle_command(conn, "📋 Список")
+    assert "Текущие маршруты" in text
+    text, markup = watcher._handle_command(conn, "❓ Помощь")
+    assert "Команды avia-watcher" in text and markup == watcher.MAIN_KEYBOARD
+
+
+def test_callback_query_removes_route_and_ignores_other_chats():
+    conn = watcher.init_db(":memory:")
+    rid = watcher.add_route_db(conn, "nal", "mow")
+    calls = {"answerCallbackQuery": [], "sendMessage": []}
+    original_chat_id = config.TELEGRAM_CHAT_ID
+    config.TELEGRAM_CHAT_ID = "555"
+    try:
+        def fake_call(method, payload):
+            if method == "answerCallbackQuery":
+                calls["answerCallbackQuery"].append(payload)
+                return {"ok": True}
+            if method == "sendMessage":
+                calls["sendMessage"].append(payload["text"])
+                return {"ok": True}
+            raise AssertionError(f"unexpected method {method}")
+
+        with _Patch(_telegram_call=fake_call):
+            # чужой чат — кнопка не должна сработать
+            watcher._handle_callback_query(
+                conn,
+                {"id": "cb1", "data": f"remove:{rid}", "message": {"chat": {"id": 999999}}},
+                allowed_chat_id="555",
+            )
+        assert len(watcher.get_active_routes(conn)) == 1, "чужой чат не должен удалить маршрут"
+        assert calls["answerCallbackQuery"] == []
+
+        with _Patch(_telegram_call=fake_call):
+            watcher._handle_callback_query(
+                conn,
+                {"id": "cb2", "data": f"remove:{rid}", "message": {"chat": {"id": 555}}},
+                allowed_chat_id="555",
+            )
+        assert watcher.get_active_routes(conn) == []
+        assert len(calls["answerCallbackQuery"]) == 1
+        assert calls["answerCallbackQuery"][0]["callback_query_id"] == "cb2"
+        assert len(calls["sendMessage"]) == 1  # подтверждение с обновлённым списком
+    finally:
+        config.TELEGRAM_CHAT_ID = original_chat_id
 
 
 def test_process_telegram_commands_authorization_and_offset():
@@ -467,8 +558,11 @@ def run_all():
         test_fetch_cheapest_handles_malformed_shapes_without_raising,
         test_pacing_does_not_burst_after_a_slow_request,
         test_add_remove_list_routes,
+        test_expand_route_to_checks_rolling_window_from_today,
+        test_migrate_routes_to_auto_dates_runs_once,
         test_seed_routes_if_empty_seeds_once,
         test_handle_command_dispatch,
+        test_callback_query_removes_route_and_ignores_other_chats,
         test_process_telegram_commands_authorization_and_offset,
     ]
     for test in tests:

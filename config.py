@@ -31,20 +31,18 @@ ORIGINS = ["NAL", "MRV", "STW", "OGZ", "GRV"]
 DESTINATIONS = ["MOW", "LED"]
 # Москва (группа SVO/DME/VKO), Санкт-Петербург
 
-DEPARTURE_AT = "2026-11"   # YYYY-MM или YYYY-MM-DD
-RETURN_AT = None           # None — только туда; иначе "YYYY-MM" / "YYYY-MM-DD"
-ONE_WAY = RETURN_AT is None
 CURRENCY = "rub"
 
+# Маршруты без даты вылета — watcher.py разворачивает каждый в скользящее
+# окно "текущий месяц + MONTHS_AHEAD-1 следующих", пересчитываемое заново на
+# каждом прогоне. Это и значит "мониторить начиная с сегодняшнего дня": окно
+# едет вперёд само, а не застывает на месяце, когда маршрут был добавлен.
+# Через /add в Telegram можно добавить и маршрут с конкретной фиксированной
+# датой — тогда он проверяется только на неё, без скользящего окна.
+MONTHS_AHEAD = 3
+
 ROUTES = [
-    {
-        "origin": origin,
-        "destination": destination,
-        "departure_at": DEPARTURE_AT,
-        "return_at": RETURN_AT,
-        "one_way": ONE_WAY,
-        "currency": CURRENCY,
-    }
+    {"origin": origin, "destination": destination, "currency": CURRENCY}
     for origin in ORIGINS
     for destination in DESTINATIONS
 ]
