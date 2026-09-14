@@ -516,28 +516,59 @@ _ALERT_HEADERS = {
     "price_ceiling": "\U0001F4B8 Дешёвый билет в Москву!",
 }
 
+# Человеческие названия городов вместо IATA-кодов в тексте алерта. Города,
+# которых здесь нет (добавленные позже через /add), просто показываются
+# кодом — не ломается, но и не выглядит так же красиво.
+CITY_NAMES = {
+    "NAL": "Нальчик",
+    "MRV": "Минеральные Воды",
+    "STW": "Ставрополь",
+    "OGZ": "Владикавказ",
+    "GRV": "Грозный",
+    "MOW": "Москва",
+    "LED": "Санкт-Петербург",
+}
+
+
+def city_name(iata):
+    return CITY_NAMES.get(iata, iata)
+
+
+_RU_MONTHS_GENITIVE = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def format_date_ru(raw):
+    """'2026-11-17T15:05:00+03:00' / '2026-11-17' -> '17 ноября'. Формат,
+    который не удалось разобрать, возвращается как есть — лучше показать
+    что-то, чем уронить отправку алерта из-за неожиданной даты."""
+    if not raw:
+        return "дата не указана"
+    try:
+        year, month, day = raw[:10].split("-")
+        month_i = int(month)
+        if 1 <= month_i <= 12:
+            return f"{int(day)} {_RU_MONTHS_GENITIVE[month_i - 1]}"
+    except (ValueError, IndexError):
+        pass
+    return raw
+
 
 def send_telegram_alert(route, price, depart_date, return_date, purchase_url,
                          is_itinerary_specific, reason="anomaly"):
     currency = route.get("currency", "rub").upper()
     text = (
         f"{_ALERT_HEADERS.get(reason, _ALERT_HEADERS['anomaly'])}\n"
-        f"{route['origin']} → {route['destination']}\n"
+        f"{city_name(route['origin'])} → {city_name(route['destination'])}\n"
         f"Цена: {price:.0f} {currency}\n"
-        f"Вылет: {depart_date or '?'}"
+        f"\U0001F4C5 {format_date_ru(depart_date)}"
     )
     if return_date:
-        text += f", обратно: {return_date}"
-    if reason == "price_ceiling":
-        text += f"\n(не дороже {config.MOSCOW_PRICE_CEILING_RUB:.0f} {currency} — не обязательно аномалия, просто дёшево)"
-    text += f"\n{purchase_url}"
-    if not is_itinerary_specific:
-        text += "\n(ссылка — общий поиск по маршруту без предустановленных дат, уточните даты на сайте)"
-    # Надёжного единого официального источника актуальных промокодов не нашлось
-    # (см. обсуждение) — не выдумываем конкретный код/сайт, только напоминаем
-    # проверить на самой странице оформления по ссылке выше.
-    text += "\n\U0001F4B3 Проверьте промокод на странице оформления по ссылке выше — иногда даёт доп. скидку"
-    send_telegram_text(text)
+        text += f" → {format_date_ru(return_date)} обратно"
+    reply_markup = {"inline_keyboard": [[{"text": "\U0001F3AB Купить билет", "url": purchase_url}]]}
+    send_telegram_text(text, reply_markup=reply_markup)
 
 
 WELCOME_TEXT = (

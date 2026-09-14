@@ -674,6 +674,37 @@ def test_ensure_alerts_reason_column_migrates_old_schema():
     assert row[0] == "anomaly", "старые строки должны получить дефолтную причину"
 
 
+def test_city_name_and_date_formatting():
+    assert watcher.city_name("NAL") == "Нальчик"
+    assert watcher.city_name("MOW") == "Москва"
+    assert watcher.city_name("ZZZ") == "ZZZ"  # неизвестный код — как есть, не падает
+
+    assert watcher.format_date_ru("2026-11-17T15:05:00+03:00") == "17 ноября"
+    assert watcher.format_date_ru("2026-01-05") == "5 января"
+    assert watcher.format_date_ru(None) == "дата не указана"
+    assert watcher.format_date_ru("не дата") == "не дата"  # мусор — не падает, возвращает как есть
+
+
+def test_send_telegram_alert_builds_city_names_date_and_button():
+    route = {"origin": "NAL", "destination": "MOW", "currency": "rub"}
+    calls = []
+
+    def fake_send_text(text, chat_id=None, reply_markup=None):
+        calls.append((text, reply_markup))
+
+    with _Patch(send_telegram_text=fake_send_text):
+        watcher.send_telegram_alert(route, 4800, "2026-11-17T15:05:00+03:00", None,
+                                     "https://example.com/buy", True, reason="anomaly")
+
+    text, markup = calls[0]
+    assert "Нальчик" in text and "Москва" in text
+    assert "17 ноября" in text
+    assert "NAL" not in text and "MOW" not in text
+    assert "https://example.com/buy" not in text, "ссылка теперь только кнопкой, не текстом"
+    assert markup["inline_keyboard"][0][0]["url"] == "https://example.com/buy"
+    assert "промокод" not in text.lower()
+
+
 def run_all():
     tests = [
         test_is_anomaly_boundary,
@@ -702,6 +733,8 @@ def run_all():
         test_travelpayouts_auth_failure_alerts_after_threshold_with_cooldown,
         test_heartbeat_sent_once_then_respects_cooldown,
         test_ensure_alerts_reason_column_migrates_old_schema,
+        test_city_name_and_date_formatting,
+        test_send_telegram_alert_builds_city_names_date_and_button,
     ]
     for test in tests:
         test()
