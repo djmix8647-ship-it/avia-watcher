@@ -465,6 +465,11 @@ def test_handle_command_dispatch():
     text, markup = watcher._handle_command(conn, "❓ Помощь")
     assert "Команды avia-watcher" in text and markup == watcher.MAIN_KEYBOARD
 
+    # "➕ Добавить" (кнопка без параметров) — подсказка с примерами, не ошибка
+    text, markup = watcher._handle_command(conn, "➕ Добавить")
+    assert "/add ORIGIN DEST" in text and "Примеры" in text
+    assert markup == watcher.MAIN_KEYBOARD
+
 
 def test_callback_query_removes_route_and_ignores_other_chats():
     conn = watcher.init_db(":memory:")

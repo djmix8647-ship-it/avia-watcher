@@ -510,10 +510,17 @@ HELP_TEXT = (
 # Постоянная клавиатура для действий без параметров — нажатие шлёт текст
 # кнопки как обычное сообщение, поэтому он же служит ключом сопоставления.
 MAIN_KEYBOARD = {
-    "keyboard": [[{"text": "📋 Список"}, {"text": "❓ Помощь"}]],
+    "keyboard": [
+        [{"text": "📋 Список"}, {"text": "➕ Добавить"}],
+        [{"text": "❓ Помощь"}],
+    ],
     "resize_keyboard": True,
 }
-_BUTTON_TEXT_TO_COMMAND = {"📋 Список": "/list", "❓ Помощь": "/help"}
+_BUTTON_TEXT_TO_COMMAND = {
+    "📋 Список": "/list",
+    "➕ Добавить": "/add",  # без параметров — команда сама покажет формат и пример
+    "❓ Помощь": "/help",
+}
 
 
 def routes_inline_keyboard(conn):
@@ -545,7 +552,16 @@ def _handle_command(conn, text):
         return format_routes_list(conn), routes_inline_keyboard(conn)
     if cmd == "/add":
         if len(parts) < 3:
-            return "Формат: /add ORIGIN DEST [YYYY-MM [YYYY-MM]]", None
+            return (
+                "Отправьте: /add ORIGIN DEST [YYYY-MM [YYYY-MM]]\n"
+                "Telegram не даёт собрать свободный ввод (коды городов, даты) в "
+                "кнопки — этот текст нужно напечатать.\n\n"
+                "Примеры:\n"
+                "/add NAL LED — Нальчик → Питер, авто-режим (скользящее окно "
+                "от сегодня, рекомендуется)\n"
+                "/add NAL LED 2026-12 — только на декабрь 2026\n"
+                "/add NAL LED 2026-12 2027-01 — туда-обратно"
+            ), MAIN_KEYBOARD
         departure_at = parts[3] if len(parts) > 3 else None
         return_at = parts[4] if len(parts) > 4 else None
         try:
