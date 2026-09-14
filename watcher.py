@@ -589,6 +589,8 @@ def process_telegram_commands(conn):
         return
 
     updates = result.get("result") or []
+    if updates:
+        log.info("Получено %d новых сообщений/нажатий от Telegram (offset был %d)", len(updates), last_id)
     allowed_chat_id = str(config.TELEGRAM_CHAT_ID)
     max_seen = last_id
 
