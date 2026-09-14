@@ -26,9 +26,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Аэропорты вылета и направления — матрица ORIGINS x DESTINATIONS.
-# Пример: несколько аэропортов одного региона против одного направления.
-ORIGINS = ["NAL"]        # Нальчик. Добавьте, например: "MRV", "OGZ", "GRV"
-DESTINATIONS = ["MOW"]   # Москва (любой город из группы MOW: SVO/DME/VKO)
+ORIGINS = ["NAL", "MRV", "STW", "OGZ", "GRV"]
+# Нальчик, Минеральные Воды, Ставрополь, Владикавказ, Грозный
+DESTINATIONS = ["MOW", "LED"]
+# Москва (группа SVO/DME/VKO), Санкт-Петербург
 
 DEPARTURE_AT = "2026-11"   # YYYY-MM или YYYY-MM-DD
 RETURN_AT = None           # None — только туда; иначе "YYYY-MM" / "YYYY-MM-DD"

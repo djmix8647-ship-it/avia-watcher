@@ -5,7 +5,6 @@
 ответа не подтверждена официальной документацией — см. README, шаг
 "первый запуск").
 """
-import itertools
 import logging
 import math
 import re
@@ -24,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("watcher")
 
 API_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
-TELEGRAM_URL_TMPL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_URL_TMPL = "https://api.telegram.org/bot{token}/{method}"
 
 TRUSTED_LINK_HOSTS = {
     "aviasales.com", "www.aviasales.com",
@@ -84,8 +83,108 @@ def init_db(path):
             PRIMARY KEY (route_id, price, depart_date, return_date)
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origin TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            departure_at TEXT NOT NULL,
+            return_at TEXT,
+            one_way INTEGER NOT NULL,
+            currency TEXT NOT NULL,
+            added_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )"""
+    )
     conn.commit()
     return conn
+
+
+def seed_routes_if_empty(conn):
+    """Маршруты живут в БД (управляются через Telegram-команды), но при первом
+    запуске (пустая таблица routes) засеваются из config.ROUTES — чтобы
+    существующая конфигурация не терялась при переходе на бот-управление."""
+    count = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
+    if count > 0:
+        return
+    for route in config.ROUTES:
+        conn.execute(
+            "INSERT INTO routes (origin, destination, departure_at, return_at, "
+            "one_way, currency, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                route["origin"], route["destination"], route["departure_at"],
+                route.get("return_at"), int(bool(route.get("one_way", True))),
+                route.get("currency", "rub"), datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    conn.commit()
+    if config.ROUTES:
+        log.info("Засеяно %d маршрут(ов) из config.py в БД", len(config.ROUTES))
+
+
+def get_active_routes(conn):
+    rows = conn.execute(
+        "SELECT id, origin, destination, departure_at, return_at, one_way, currency "
+        "FROM routes ORDER BY id"
+    ).fetchall()
+    return [
+        {
+            "db_id": r[0], "origin": r[1], "destination": r[2],
+            "departure_at": r[3], "return_at": r[4],
+            "one_way": bool(r[5]), "currency": r[6],
+        }
+        for r in rows
+    ]
+
+
+_IATA_RE = re.compile(r"^[A-Za-z]{3}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}(-\d{2})?$")
+
+
+def add_route_db(conn, origin, destination, departure_at, return_at=None, currency=None):
+    origin = (origin or "").upper()
+    destination = (destination or "").upper()
+    if not _IATA_RE.match(origin) or not _IATA_RE.match(destination):
+        raise ValueError("IATA-код города — 3 латинские буквы (например NAL, MOW)")
+    if not _DATE_RE.match(departure_at or ""):
+        raise ValueError("дата вылета в формате YYYY-MM или YYYY-MM-DD")
+    if return_at and not _DATE_RE.match(return_at):
+        raise ValueError("дата обратно в формате YYYY-MM или YYYY-MM-DD")
+    cur = conn.execute(
+        "INSERT INTO routes (origin, destination, departure_at, return_at, "
+        "one_way, currency, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            origin, destination, departure_at, return_at, int(return_at is None),
+            (currency or config.CURRENCY).lower(), datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def remove_route_db(conn, db_id):
+    cur = conn.execute("DELETE FROM routes WHERE id = ?", (db_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def format_routes_list(conn):
+    routes = get_active_routes(conn)
+    if not routes:
+        return "Маршруты не настроены. Добавьте: /add ORIGIN DEST YYYY-MM"
+    lines = ["Текущие маршруты:"]
+    for r in routes:
+        line = f"{r['db_id']}. {r['origin']} → {r['destination']}, вылет {r['departure_at']}"
+        if r["return_at"]:
+            line += f", обратно {r['return_at']}"
+        line += f" ({r['currency'].upper()})"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def fetch_cheapest(route, token, rate_limited_until):
@@ -280,6 +379,27 @@ class TelegramRateLimited(Exception):
         self.retry_after_seconds = retry_after_seconds
 
 
+def _telegram_call(method, payload):
+    """Общий вызов Telegram Bot API — POST+JSON работает для любого метода,
+    включая getUpdates. Общая обработка 429/ошибок для всех вызовов бота."""
+    url = TELEGRAM_URL_TMPL.format(token=config.TELEGRAM_BOT_TOKEN, method=method)
+    resp = requests.post(url, json=payload, timeout=config.REQUEST_TIMEOUT_SECONDS)
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after else 60.0
+        except ValueError:
+            delay = 60.0
+        raise TelegramRateLimited(delay)
+    if resp.status_code != 200:
+        raise requests.HTTPError(f"Telegram {method} failed: status={resp.status_code}")
+    return resp.json()
+
+
+def send_telegram_text(text, chat_id=None):
+    _telegram_call("sendMessage", {"chat_id": chat_id or config.TELEGRAM_CHAT_ID, "text": text})
+
+
 def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
     currency = route.get("currency", "rub").upper()
     text = (
@@ -293,22 +413,93 @@ def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is
     text += f"\n{purchase_url}"
     if not is_itinerary_specific:
         text += "\n(ссылка — общий поиск по маршруту без предустановленных дат, уточните даты на сайте)"
+    send_telegram_text(text)
 
-    url = TELEGRAM_URL_TMPL.format(token=config.TELEGRAM_BOT_TOKEN)
-    resp = requests.post(
-        url,
-        json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text},
-        timeout=config.REQUEST_TIMEOUT_SECONDS,
-    )
-    if resp.status_code == 429:
-        retry_after = resp.headers.get("Retry-After")
+
+HELP_TEXT = (
+    "Команды avia-watcher:\n"
+    "/list — список маршрутов\n"
+    "/add ORIGIN DEST YYYY-MM [YYYY-MM] — добавить маршрут "
+    "(вторая дата опциональна — обратный билет; без неё — только туда)\n"
+    "/remove N — удалить маршрут по номеру из /list\n"
+    "/help — эта подсказка"
+)
+
+
+def _handle_command(conn, text):
+    parts = text.strip().split()
+    if not parts:
+        return None
+    cmd = parts[0].lower().split("@")[0]  # /add@имя_бота -> /add
+
+    if cmd in ("/start", "/help"):
+        return HELP_TEXT
+    if cmd == "/list":
+        return format_routes_list(conn)
+    if cmd == "/add":
+        if len(parts) < 4:
+            return "Формат: /add ORIGIN DEST YYYY-MM [YYYY-MM]"
+        return_at = parts[4] if len(parts) > 4 else None
         try:
-            delay = float(retry_after) if retry_after else 60.0
-        except ValueError:
-            delay = 60.0
-        raise TelegramRateLimited(delay)
-    if resp.status_code != 200:
-        raise requests.HTTPError(f"Telegram sendMessage failed: status={resp.status_code}")
+            new_id = add_route_db(conn, parts[1], parts[2], parts[3], return_at)
+        except ValueError as e:
+            return f"Ошибка: {e}"
+        return f"Добавлено: #{new_id}\n\n{format_routes_list(conn)}"
+    if cmd == "/remove":
+        if len(parts) < 2 or not parts[1].isdigit():
+            return "Формат: /remove N (номер из /list)"
+        ok = remove_route_db(conn, int(parts[1]))
+        if not ok:
+            return f"Маршрут #{parts[1]} не найден"
+        return f"Удалено: #{parts[1]}\n\n{format_routes_list(conn)}"
+    return f"Неизвестная команда: {parts[0]}\n\n{HELP_TEXT}"
+
+
+def _get_bot_state(conn, key, default=None):
+    row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def _set_bot_state(conn, key, value):
+    conn.execute(
+        "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+    conn.commit()
+
+
+def process_telegram_commands(conn):
+    """Короткий (не long-poll) опрос новых сообщений боту и их выполнение.
+    Только сообщения из TELEGRAM_CHAT_ID исполняются — не тот, кому бот
+    прислал бы алерт, не может им управлять."""
+    last_id = int(_get_bot_state(conn, "last_update_id", "0") or "0")
+    try:
+        result = _telegram_call("getUpdates", {"offset": last_id + 1, "timeout": 0})
+    except Exception as e:
+        log.error("Не удалось получить команды из Telegram (%s)", type(e).__name__)
+        return
+
+    updates = result.get("result") or []
+    allowed_chat_id = str(config.TELEGRAM_CHAT_ID)
+    max_seen = last_id
+
+    for update in updates:
+        max_seen = max(max_seen, update.get("update_id", max_seen))
+        message = update.get("message") or {}
+        chat = message.get("chat") or {}
+        text = message.get("text")
+        if not text or str(chat.get("id")) != allowed_chat_id:
+            continue  # чужой чат — молча игнорируем, offset всё равно продвигаем
+        reply = _handle_command(conn, text)
+        if reply:
+            try:
+                send_telegram_text(reply)
+            except Exception as e:
+                log.error("Не удалось ответить на команду в Telegram (%s)", type(e).__name__)
+
+    if max_seen > last_id:
+        _set_bot_state(conn, "last_update_id", max_seen)
 
 
 def flush_pending_alerts(conn, route, rid):
@@ -400,8 +591,7 @@ def check_route(conn, route, rate_limited_until):
     flush_pending_alerts(conn, route, rid)
 
 
-def compute_effective_interval():
-    n = len(config.ROUTES)
+def compute_effective_interval(n):
     if n == 0 or config.MAX_REQUESTS_PER_MINUTE <= 0:
         return config.POLL_INTERVAL_SECONDS
     budget_interval = math.ceil(n * 60 / config.MAX_REQUESTS_PER_MINUTE)
@@ -434,56 +624,71 @@ def next_schedule_time(prev_next_at, spacing, now):
     return base + spacing
 
 
-def main():
+def _require_tokens():
     if not config.TRAVELPAYOUTS_TOKEN or not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-        raise SystemExit("Заполните TRAVELPAYOUTS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID в .env")
+        raise SystemExit("Заполните TRAVELPAYOUTS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (.env или секреты)")
 
-    if not config.ROUTES:
-        raise SystemExit("ROUTES пуст — нечего опрашивать, проверьте config.py")
 
+def main():
+    """Бесконечный цикл для своего сервера (VPS/systemd) — маршруты и команды
+    из Telegram перечитываются из БД перед каждым полным проходом, так что
+    /add и /remove подхватываются без перезапуска процесса."""
+    _require_tokens()
     conn = init_db(config.DB_PATH)
-    interval = compute_effective_interval()
+    seed_routes_if_empty(conn)
     rate_limited_until = {}
-    n = len(config.ROUTES)
-    # REV-024: N запросов не должны выстреливать пачкой в начале цикла — иначе
-    # средний темп укладывается в бюджет, а мгновенный всплеск — нет. Каждый
-    # маршрут опрашивается раз в `interval` секунд, но сами маршруты внутри
-    # цикла равномерно разнесены по времени, а не выполняются одним блоком.
-    spacing = compute_request_spacing(interval, n)
+    log.info("Запуск (демон): опрашиваю маршруты из БД, базовый интервал %dс", config.POLL_INTERVAL_SECONDS)
 
-    log.info("Запуск: %d маршрут(ов), интервал %dс (шаг между запросами %.1fс)", n, interval, spacing)
+    while True:
+        process_telegram_commands(conn)
+        routes = get_active_routes(conn)
+        if not routes:
+            log.info("Маршруты не настроены — жду команду /add в Telegram")
+            time.sleep(config.POLL_INTERVAL_SECONDS)
+            continue
 
-    next_at = time.monotonic()
-    routes_cycle = itertools.cycle(config.ROUTES)
-    for route in routes_cycle:
-        now = time.monotonic()
-        if next_at > now:
-            time.sleep(next_at - now)
-        next_at = next_schedule_time(next_at, spacing, now)
+        n = len(routes)
+        interval = compute_effective_interval(n)
+        # REV-024: N запросов не должны выстреливать пачкой — каждый маршрут
+        # опрашивается раз в `interval` секунд, но сами запросы внутри одного
+        # прохода равномерно разнесены по времени, а не идут одним блоком.
+        spacing = compute_request_spacing(interval, n)
+        next_at = time.monotonic()
 
-        rid = route_id(route)
-        try:
-            check_route(conn, route, rate_limited_until)
-        except requests.RequestException as e:
-            log.error("%s: ошибка сети/API (%s)", rid, type(e).__name__)
-        except Exception:
-            log.exception("%s: непредвиденная ошибка", rid)
+        for route in routes:
+            now = time.monotonic()
+            if next_at > now:
+                time.sleep(next_at - now)
+            next_at = next_schedule_time(next_at, spacing, now)
+
+            rid = route_id(route)
+            try:
+                check_route(conn, route, rate_limited_until)
+            except requests.RequestException as e:
+                log.error("%s: ошибка сети/API (%s)", rid, type(e).__name__)
+            except Exception:
+                log.exception("%s: непредвиденная ошибка", rid)
 
 
 def run_once():
     """Один проход по всем маршрутам и выход — для планировщиков вроде GitHub
     Actions, которые сами берут на себя периодичность (cron), в отличие от
     main(), которая держит собственный бесконечный цикл для VPS/systemd."""
-    if not config.TRAVELPAYOUTS_TOKEN or not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-        raise SystemExit("Заполните TRAVELPAYOUTS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (.env или секреты)")
-    if not config.ROUTES:
-        raise SystemExit("ROUTES пуст — нечего опрашивать, проверьте config.py")
-
+    _require_tokens()
     conn = init_db(config.DB_PATH)
-    rate_limited_until = {}
-    log.info("Разовый запуск: %d маршрут(ов)", len(config.ROUTES))
+    seed_routes_if_empty(conn)
+    process_telegram_commands(conn)
 
-    for i, route in enumerate(config.ROUTES):
+    routes = get_active_routes(conn)
+    if not routes:
+        log.info("Маршруты не настроены (пусто) — нечего проверять в этом прогоне")
+        conn.close()
+        return
+
+    rate_limited_until = {}
+    log.info("Разовый запуск: %d маршрут(ов)", len(routes))
+
+    for i, route in enumerate(routes):
         if i > 0:
             time.sleep(1)  # небольшой разнос запросов, без сложной пейсинг-математики main()
         rid = route_id(route)

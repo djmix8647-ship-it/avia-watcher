@@ -358,6 +358,99 @@ def test_pacing_does_not_burst_after_a_slow_request():
     assert next_at > 130.0, "следующий запрос обязан быть в будущем, а не немедленным"
 
 
+def test_add_remove_list_routes():
+    conn = watcher.init_db(":memory:")
+    assert watcher.format_routes_list(conn) == "Маршруты не настроены. Добавьте: /add ORIGIN DEST YYYY-MM"
+
+    rid1 = watcher.add_route_db(conn, "nal", "mow", "2026-11")
+    routes = watcher.get_active_routes(conn)
+    assert len(routes) == 1
+    assert routes[0]["origin"] == "NAL" and routes[0]["one_way"] is True
+
+    rid2 = watcher.add_route_db(conn, "led", "aer", "2026-12", "2026-12-20")
+    routes = watcher.get_active_routes(conn)
+    assert len(routes) == 2
+    assert routes[1]["return_at"] == "2026-12-20"
+    assert routes[1]["one_way"] is False
+
+    for bad_origin, bad_dest, bad_date in [("N", "MOW", "2026-11"), ("NAL", "MOW", "ноябрь")]:
+        try:
+            watcher.add_route_db(conn, bad_origin, bad_dest, bad_date)
+            assert False, "должна была бросить ValueError на невалидном вводе"
+        except ValueError:
+            pass
+
+    assert watcher.remove_route_db(conn, rid1) is True
+    assert watcher.remove_route_db(conn, 9999) is False
+    routes = watcher.get_active_routes(conn)
+    assert len(routes) == 1 and routes[0]["db_id"] == rid2
+
+
+def test_seed_routes_if_empty_seeds_once():
+    conn = watcher.init_db(":memory:")
+    watcher.seed_routes_if_empty(conn)
+    assert len(watcher.get_active_routes(conn)) == len(config.ROUTES)
+
+    watcher.add_route_db(conn, "led", "aer", "2026-12")
+    watcher.seed_routes_if_empty(conn)  # не должно пересеять/задвоить
+    assert len(watcher.get_active_routes(conn)) == len(config.ROUTES) + 1
+
+
+def test_handle_command_dispatch():
+    conn = watcher.init_db(":memory:")
+    assert "Команды avia-watcher" in watcher._handle_command(conn, "/help")
+    assert "не настроены" in watcher._handle_command(conn, "/list")
+
+    reply = watcher._handle_command(conn, "/add nal mow 2026-11")
+    assert reply.startswith("Добавлено: #1")
+    assert "NAL" in watcher._handle_command(conn, "/list")
+
+    assert "Ошибка" in watcher._handle_command(conn, "/add ZZ mow 2026-11")
+
+    reply = watcher._handle_command(conn, "/remove 1")
+    assert reply.startswith("Удалено: #1")
+    assert "не настроены" in watcher._handle_command(conn, "/list")
+
+    assert "не найден" in watcher._handle_command(conn, "/remove 999")
+    assert "Неизвестная команда" in watcher._handle_command(conn, "/unknown")
+
+
+def test_process_telegram_commands_authorization_and_offset():
+    """Только команды из TELEGRAM_CHAT_ID исполняются; offset не даёт
+    повторно обработать те же апдейты на следующем вызове."""
+    conn = watcher.init_db(":memory:")
+    calls = {"getUpdates": 0, "sendMessage": []}
+    original_chat_id = config.TELEGRAM_CHAT_ID
+    config.TELEGRAM_CHAT_ID = "555"
+    try:
+        def fake_call(method, payload):
+            if method == "getUpdates":
+                calls["getUpdates"] += 1
+                if calls["getUpdates"] == 1:
+                    return {"result": [
+                        {"update_id": 100, "message": {"chat": {"id": 999999}, "text": "/add NAL MOW 2026-11"}},
+                        {"update_id": 101, "message": {"chat": {"id": 555}, "text": "/list"}},
+                    ]}
+                return {"result": []}
+            if method == "sendMessage":
+                calls["sendMessage"].append(payload["text"])
+                return {"ok": True}
+            raise AssertionError(f"unexpected method {method}")
+
+        with _Patch(_telegram_call=fake_call):
+            watcher.process_telegram_commands(conn)
+
+        assert watcher.get_active_routes(conn) == [], "чужой чат не должен был исполнить /add"
+        assert len(calls["sendMessage"]) == 1, "ответ только на /list из разрешённого чата"
+
+        with _Patch(_telegram_call=fake_call):
+            watcher.process_telegram_commands(conn)
+        assert calls["getUpdates"] == 2
+        assert len(calls["sendMessage"]) == 1, "не должно быть повторной обработки тех же update_id"
+    finally:
+        config.TELEGRAM_CHAT_ID = original_chat_id
+
+
 def run_all():
     tests = [
         test_is_anomaly_boundary,
@@ -373,6 +466,10 @@ def run_all():
         test_request_spacing_keeps_burst_within_budget,
         test_fetch_cheapest_handles_malformed_shapes_without_raising,
         test_pacing_does_not_burst_after_a_slow_request,
+        test_add_remove_list_routes,
+        test_seed_routes_if_empty_seeds_once,
+        test_handle_command_dispatch,
+        test_process_telegram_commands_authorization_and_offset,
     ]
     for test in tests:
         test()
