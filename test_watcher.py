@@ -2,6 +2,7 @@
 
 Запуск: python test_watcher.py
 """
+import sqlite3
 from datetime import datetime
 
 import config
@@ -104,7 +105,7 @@ def test_check_route_alert_and_dedup():
     def fake_fetch(route, token, rate_limited_until):
         return make_entry(3000)
 
-    def fake_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
+    def fake_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific, reason="anomaly"):
         sent.append(price)
 
     def counting_record(conn_, rid_, entry_):
@@ -164,7 +165,7 @@ def test_flush_runs_even_when_fetch_returns_none():
     def fake_fetch_none(route, token, rate_limited_until):
         return None
 
-    def fake_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
+    def fake_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific, reason="anomaly"):
         sent.append(price)
 
     with _Patch(fetch_cheapest=fake_fetch_none, send_telegram_alert=fake_send):
@@ -186,7 +187,7 @@ def test_claim_persists_exact_link_used_by_flush():
 
     seen = []
 
-    def fake_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
+    def fake_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific, reason="anomaly"):
         seen.append((purchase_url, is_itinerary_specific))
 
     with _Patch(send_telegram_alert=fake_send):
@@ -213,7 +214,7 @@ def test_pending_alert_delivered_despite_baseline_drift():
     def fake_fetch(route, token, rate_limited_until):
         return make_entry(3000)
 
-    def flaky_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
+    def flaky_send(route, price, depart_date, return_date, purchase_url, is_itinerary_specific, reason="anomaly"):
         if state["fail"]:
             raise RuntimeError("simulated Telegram outage")
         sent.append(price)
@@ -547,6 +548,132 @@ def test_process_telegram_commands_authorization_and_offset():
         config.TELEGRAM_CHAT_ID = original_chat_id
 
 
+def test_price_below_plausible_floor_treated_as_bad_data():
+    route = dict(TEST_ROUTE)
+    body = {"data": [{"price": 1, "depart_date": "2026-11-10"}]}
+
+    def fake_get(url, params, headers, timeout):
+        return FakeResponse(status_code=200, json_body=body)
+
+    original_get = watcher.requests.get
+    watcher.requests.get = fake_get
+    try:
+        result = watcher.fetch_cheapest(route, "token", {})
+    finally:
+        watcher.requests.get = original_get
+    assert result is None, "цена ниже MIN_PLAUSIBLE_PRICE_RUB — похоже на битые данные, не на глюк-тариф"
+
+
+def test_moscow_price_ceiling_fires_even_when_not_an_anomaly():
+    """Запрошено явно: билет в Москву <= порога шлётся всегда, даже если это
+    и есть текущая медиана (не статистическая аномалия)."""
+    conn = watcher.init_db(":memory:")
+    route = {"origin": "NAL", "destination": "MOW", "departure_at": "2026-11",
+             "return_at": None, "one_way": True, "currency": "rub"}
+    rid = watcher.route_id(route)
+    for _ in range(config.MIN_HISTORY_SAMPLES):
+        watcher.record_price(conn, rid, make_entry(4200))
+
+    sent = []
+
+    def fake_fetch(route, token, rate_limited_until):
+        return make_entry(4200)  # равно медиане — не аномалия, но <= потолка
+
+    def fake_send(route, price, depart_date, return_date, purchase_url,
+                   is_itinerary_specific, reason="anomaly"):
+        sent.append((price, reason))
+
+    with _Patch(fetch_cheapest=fake_fetch, send_telegram_alert=fake_send):
+        watcher.check_route(conn, route, {})
+
+    assert sent == [(4200, "price_ceiling")]
+
+
+def test_moscow_price_ceiling_respects_threshold_and_destination():
+    conn = watcher.init_db(":memory:")
+    route_mow = {"origin": "NAL", "destination": "MOW", "departure_at": "2026-11",
+                 "return_at": None, "one_way": True, "currency": "rub"}
+    route_led = {"origin": "NAL", "destination": "LED", "departure_at": "2026-11",
+                 "return_at": None, "one_way": True, "currency": "rub"}
+    sent = []
+
+    def fake_send(route, price, depart_date, return_date, purchase_url,
+                   is_itinerary_specific, reason="anomaly"):
+        sent.append((route["destination"], price, reason))
+
+    def fake_fetch_above_ceiling(route, token, rate_limited_until):
+        return make_entry(config.MOSCOW_PRICE_CEILING_RUB + 500)
+
+    with _Patch(fetch_cheapest=fake_fetch_above_ceiling, send_telegram_alert=fake_send):
+        watcher.check_route(conn, route_mow, {})
+    assert sent == [], "выше потолка — не должен слать по этой причине"
+
+    def fake_fetch_cheap_led(route, token, rate_limited_until):
+        return make_entry(1000)
+
+    with _Patch(fetch_cheapest=fake_fetch_cheap_led, send_telegram_alert=fake_send):
+        watcher.check_route(conn, route_led, {})
+    assert sent == [], "порог только для Москвы (MOW), не для других направлений"
+
+
+def test_travelpayouts_auth_failure_alerts_after_threshold_with_cooldown():
+    conn = watcher.init_db(":memory:")
+    sent = []
+
+    def fake_send_text(text, chat_id=None, reply_markup=None):
+        sent.append(text)
+
+    with _Patch(send_telegram_text=fake_send_text):
+        for _ in range(watcher.AUTH_FAILURE_ALERT_THRESHOLD - 1):
+            watcher.note_travelpayouts_auth_result(conn, ok=False)
+        assert sent == [], "до порога подряд идущих неудач — тишина"
+
+        watcher.note_travelpayouts_auth_result(conn, ok=False)
+        assert len(sent) == 1 and "401" in sent[0]
+
+        watcher.note_travelpayouts_auth_result(conn, ok=False)
+        assert len(sent) == 1, "cooldown не даёт продублировать предупреждение сразу же"
+
+        watcher.note_travelpayouts_auth_result(conn, ok=True)
+        assert watcher._get_bot_state(conn, "tp_auth_fail_count") == "0"
+
+
+def test_heartbeat_sent_once_then_respects_cooldown():
+    conn = watcher.init_db(":memory:")
+    sent = []
+
+    def fake_send_text(text, chat_id=None, reply_markup=None):
+        sent.append(text)
+
+    with _Patch(send_telegram_text=fake_send_text):
+        watcher.maybe_send_heartbeat(conn, 10)
+        assert len(sent) == 1 and "10" in sent[0]
+
+        watcher.maybe_send_heartbeat(conn, 10)
+        assert len(sent) == 1, "повторный вызов в пределах суток не должен дублировать"
+
+
+def test_ensure_alerts_reason_column_migrates_old_schema():
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """CREATE TABLE alerts (
+            route_id TEXT NOT NULL, price REAL NOT NULL, depart_date TEXT, return_date TEXT,
+            purchase_url TEXT NOT NULL, is_itinerary_specific INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
+            PRIMARY KEY (route_id, price, depart_date, return_date)
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO alerts (route_id, price, depart_date, return_date, purchase_url, "
+        "is_itinerary_specific, status, created_at) VALUES ('R',100,'d','','u',1,'pending','now')"
+    )
+    conn.commit()
+    watcher._ensure_alerts_reason_column(conn)
+    row = conn.execute("SELECT reason FROM alerts WHERE route_id='R'").fetchone()
+    assert row[0] == "anomaly", "старые строки должны получить дефолтную причину"
+
+
 def run_all():
     tests = [
         test_is_anomaly_boundary,
@@ -569,6 +696,12 @@ def run_all():
         test_handle_command_dispatch,
         test_callback_query_removes_route_and_ignores_other_chats,
         test_process_telegram_commands_authorization_and_offset,
+        test_price_below_plausible_floor_treated_as_bad_data,
+        test_moscow_price_ceiling_fires_even_when_not_an_anomaly,
+        test_moscow_price_ceiling_respects_threshold_and_destination,
+        test_travelpayouts_auth_failure_alerts_after_threshold_with_cooldown,
+        test_heartbeat_sent_once_then_respects_cooldown,
+        test_ensure_alerts_reason_column_migrates_old_schema,
     ]
     for test in tests:
         test()

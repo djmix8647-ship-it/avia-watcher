@@ -35,6 +35,16 @@ _TOKEN_QS_RE = re.compile(r"([?&](?:token|X-Access-Token)=)[^&]*", re.IGNORECASE
 _BOT_PATH_RE = re.compile(r"/bot[0-9]+:[A-Za-z0-9_-]+/")
 
 
+class TravelpayoutsAuthError(Exception):
+    """401/403 от Travelpayouts — токен неверный или истёк. Отдельно от
+    прочих ошибок, чтобы check_route мог считать подряд идущие случаи и
+    один раз предупредить в Telegram, а не спамить и не молчать вечно."""
+
+    def __init__(self, status_code):
+        super().__init__(f"Travelpayouts auth error, status={status_code}")
+        self.status_code = status_code
+
+
 def redact_url(url):
     """Убирает значения токенов из URL перед логированием (REV-018)."""
     url = _TOKEN_QS_RE.sub(r"\1***", url)
@@ -80,9 +90,11 @@ def init_db(path):
             created_at TEXT NOT NULL,
             attempt_count INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT,
+            reason TEXT NOT NULL DEFAULT 'anomaly',
             PRIMARY KEY (route_id, price, depart_date, return_date)
         )"""
     )
+    _ensure_alerts_reason_column(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS routes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +116,18 @@ def init_db(path):
     conn.commit()
     _ensure_routes_departure_at_nullable(conn)
     return conn
+
+
+def _ensure_alerts_reason_column(conn):
+    """Уже задеплоенный prices.db мог быть создан до появления причины алерта
+    (anomaly/price_ceiling) — в отличие от routes.departure_at, тут можно
+    обойтись простым ADD COLUMN (SQLite поддерживает NOT NULL DEFAULT при
+    добавлении новой колонки, старые строки получат значение по умолчанию)."""
+    cols = conn.execute("PRAGMA table_info(alerts)").fetchall()
+    if any(c[1] == "reason" for c in cols):
+        return
+    conn.execute("ALTER TABLE alerts ADD COLUMN reason TEXT NOT NULL DEFAULT 'anomaly'")
+    conn.commit()
 
 
 def _ensure_routes_departure_at_nullable(conn):
@@ -300,6 +324,10 @@ def fetch_cheapest(route, token, rate_limited_until):
         log.warning("%s: Travelpayouts вернул 429, ждём %.0fс", rid, delay)
         return None
 
+    if resp.status_code in (401, 403):
+        log.error("%s: Travelpayouts HTTP %s — похоже, токен неверный/истёк", rid, resp.status_code)
+        raise TravelpayoutsAuthError(resp.status_code)
+
     if resp.status_code != 200:
         log.error("%s: Travelpayouts HTTP %s (%s)", rid, resp.status_code, redact_url(resp.url))
         return None
@@ -348,6 +376,11 @@ def fetch_cheapest(route, token, rate_limited_until):
         except (TypeError, ValueError):
             continue
         if not math.isfinite(price_value):
+            continue
+        # Явно битые данные (0/1 рубль и т.п.) не должны выглядеть как глюк-тариф.
+        # Порог завязан на рубли — для других валют пока не применяется (весь
+        # проект сейчас работает в rub, см. config.CURRENCY).
+        if route.get("currency", "rub") == "rub" and price_value < config.MIN_PLAUSIBLE_PRICE_RUB:
             continue
         return {
             "price": price_value,
@@ -419,7 +452,7 @@ def build_purchase_link(route, entry):
     return url, False
 
 
-def claim_alert(conn, rid, route, entry):
+def claim_alert(conn, rid, route, entry, reason="anomaly"):
     # depart_date/return_date идут в PRIMARY KEY и в WHERE-сравнения по равенству —
     # в SQLite (как и в стандартном SQL) NULL никогда не равен NULL, так что для
     # one-way маршрутов (return_date отсутствует) UPDATE...WHERE return_date=?
@@ -429,8 +462,8 @@ def claim_alert(conn, rid, route, entry):
     conn.execute(
         "INSERT OR IGNORE INTO alerts "
         "(route_id, price, depart_date, return_date, purchase_url, is_itinerary_specific, "
-        " status, created_at, attempt_count, next_attempt_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL)",
+        " status, created_at, attempt_count, next_attempt_at, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 0, NULL, ?)",
         (
             rid,
             entry["price"],
@@ -439,6 +472,7 @@ def claim_alert(conn, rid, route, entry):
             purchase_url,
             int(is_itinerary_specific),
             datetime.now(timezone.utc).isoformat(),
+            reason,
         ),
     )
     conn.commit()
@@ -477,16 +511,25 @@ def send_telegram_text(text, chat_id=None, reply_markup=None):
     _telegram_call("sendMessage", payload)
 
 
-def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is_itinerary_specific):
+_ALERT_HEADERS = {
+    "anomaly": "\U0001F525 Аномально дешёвый билет!",
+    "price_ceiling": "\U0001F4B8 Дешёвый билет в Москву!",
+}
+
+
+def send_telegram_alert(route, price, depart_date, return_date, purchase_url,
+                         is_itinerary_specific, reason="anomaly"):
     currency = route.get("currency", "rub").upper()
     text = (
-        f"\U0001F525 Аномально дешёвый билет!\n"
+        f"{_ALERT_HEADERS.get(reason, _ALERT_HEADERS['anomaly'])}\n"
         f"{route['origin']} → {route['destination']}\n"
         f"Цена: {price:.0f} {currency}\n"
         f"Вылет: {depart_date or '?'}"
     )
     if return_date:
         text += f", обратно: {return_date}"
+    if reason == "price_ceiling":
+        text += f"\n(не дороже {config.MOSCOW_PRICE_CEILING_RUB:.0f} {currency} — не обязательно аномалия, просто дёшево)"
     text += f"\n{purchase_url}"
     if not is_itinerary_specific:
         text += "\n(ссылка — общий поиск по маршруту без предустановленных дат, уточните даты на сайте)"
@@ -496,6 +539,15 @@ def send_telegram_alert(route, price, depart_date, return_date, purchase_url, is
     text += "\n\U0001F4B3 Проверьте промокод на странице оформления по ссылке выше — иногда даёт доп. скидку"
     send_telegram_text(text)
 
+
+WELCOME_TEXT = (
+    "✈️ Привет! Я avia-watcher.\n\n"
+    "Слежу за ценами на авиабилеты по вашим маршрутам и пишу сюда, когда "
+    "нахожу что-то реально стоящее: цену намного ниже обычной для этого "
+    "маршрута, или просто дешёвый билет в Москву.\n\n"
+    "Маршруты уже настроены и проверяются каждые ~5 минут. Посмотреть "
+    "список или добавить свой — кнопками внизу."
+)
 
 HELP_TEXT = (
     "Команды avia-watcher:\n"
@@ -546,7 +598,9 @@ def _handle_command(conn, text):
         return None, None
     cmd = _BUTTON_TEXT_TO_COMMAND.get(stripped, parts[0].lower().split("@")[0])  # /add@bot -> /add
 
-    if cmd in ("/start", "/help"):
+    if cmd == "/start":
+        return WELCOME_TEXT, MAIN_KEYBOARD
+    if cmd == "/help":
         return HELP_TEXT, MAIN_KEYBOARD
     if cmd == "/list":
         return format_routes_list(conn), routes_inline_keyboard(conn)
@@ -591,6 +645,71 @@ def _set_bot_state(conn, key, value):
         (key, str(value)),
     )
     conn.commit()
+
+
+AUTH_FAILURE_ALERT_THRESHOLD = 3        # столько подряд неудач, прежде чем предупредить
+AUTH_FAILURE_ALERT_COOLDOWN_SECONDS = 6 * 3600  # не чаще раза в 6 часов
+
+
+def note_travelpayouts_auth_result(conn, ok):
+    """Считает подряд идущие 401/403 от Travelpayouts; после
+    AUTH_FAILURE_ALERT_THRESHOLD подряд — одно предупреждение в Telegram (не
+    чаще раза в AUTH_FAILURE_ALERT_COOLDOWN_SECONDS, чтобы не спамить, пока
+    токен не починят)."""
+    if ok:
+        if _get_bot_state(conn, "tp_auth_fail_count", "0") != "0":
+            _set_bot_state(conn, "tp_auth_fail_count", "0")
+        return
+
+    count = int(_get_bot_state(conn, "tp_auth_fail_count", "0") or "0") + 1
+    _set_bot_state(conn, "tp_auth_fail_count", count)
+    if count < AUTH_FAILURE_ALERT_THRESHOLD:
+        return
+
+    now = datetime.now(timezone.utc)
+    last_alert = _get_bot_state(conn, "tp_auth_alert_sent_at")
+    if last_alert:
+        try:
+            if (now - datetime.fromisoformat(last_alert)).total_seconds() < AUTH_FAILURE_ALERT_COOLDOWN_SECONDS:
+                return
+        except ValueError:
+            pass
+    try:
+        send_telegram_text(
+            "⚠️ Travelpayouts третий раз подряд отвечает 401/403 — "
+            "похоже, TRAVELPAYOUTS_TOKEN неверный или истёк. Пока не "
+            "поправите его в настройках (Secrets на GitHub или .env), цены "
+            "не обновляются."
+        )
+    except Exception as e:
+        log.error("Не удалось отправить предупреждение о токене Travelpayouts (%s)", type(e).__name__)
+        return
+    _set_bot_state(conn, "tp_auth_alert_sent_at", now.isoformat())
+
+
+HEARTBEAT_INTERVAL_SECONDS = 20 * 3600  # не чаще раза в ~20 часов
+
+
+def maybe_send_heartbeat(conn, num_routes):
+    """Раз в сутки — короткое "жив, N маршрутов" в Telegram. Без этого тишина
+    ("аномалий не нашлось") неотличима от "сломался и молчит"."""
+    now = datetime.now(timezone.utc)
+    last = _get_bot_state(conn, "last_heartbeat_at")
+    if last:
+        try:
+            if (now - datetime.fromisoformat(last)).total_seconds() < HEARTBEAT_INTERVAL_SECONDS:
+                return
+        except ValueError:
+            pass
+    try:
+        send_telegram_text(
+            f"✅ avia-watcher жив. Маршрутов под наблюдением: {num_routes}. "
+            f"Последняя проверка: {now.strftime('%d.%m %H:%M')} UTC."
+        )
+    except Exception as e:
+        log.error("Не удалось отправить heartbeat (%s)", type(e).__name__)
+        return
+    _set_bot_state(conn, "last_heartbeat_at", now.isoformat())
 
 
 def process_telegram_commands(conn):
@@ -667,13 +786,13 @@ def flush_pending_alerts(conn, route, rid):
     now = datetime.now(timezone.utc)
     rows = conn.execute(
         "SELECT price, depart_date, return_date, purchase_url, is_itinerary_specific, "
-        "created_at, attempt_count, next_attempt_at "
+        "created_at, attempt_count, next_attempt_at, reason "
         "FROM alerts WHERE route_id = ? AND status = 'pending'",
         (rid,),
     ).fetchall()
 
     for price, depart_date, return_date, purchase_url, is_itinerary_specific, \
-            created_at, attempt_count, next_attempt_at in rows:
+            created_at, attempt_count, next_attempt_at, reason in rows:
         if next_attempt_at:
             try:
                 if datetime.fromisoformat(next_attempt_at) > now:
@@ -697,7 +816,7 @@ def flush_pending_alerts(conn, route, rid):
 
         try:
             send_telegram_alert(route, price, depart_date, return_date,
-                                 purchase_url, bool(is_itinerary_specific))
+                                 purchase_url, bool(is_itinerary_specific), reason)
         except Exception as e:
             # НЕ log.exception/str(e) здесь: сетевые исключения requests (Timeout,
             # ConnectionError) содержат полный URL, включая TELEGRAM_BOT_TOKEN в пути
@@ -734,18 +853,35 @@ def check_route(conn, route, rate_limited_until):
         log.info("%s: пропуск цикла — ждём окончания rate-limit", rid)
         entry = None
     else:
-        entry = fetch_cheapest(route, config.TRAVELPAYOUTS_TOKEN, rate_limited_until)
+        try:
+            entry = fetch_cheapest(route, config.TRAVELPAYOUTS_TOKEN, rate_limited_until)
+        except TravelpayoutsAuthError:
+            entry = None
+            note_travelpayouts_auth_result(conn, ok=False)
+        else:
+            if entry is not None:
+                note_travelpayouts_auth_result(conn, ok=True)
 
     if entry is not None:
+        is_actual = entry.get("actual") is not False
         history = get_recent_prices(conn, rid, config.HISTORY_WINDOW)
 
-        if entry.get("actual") is not False and len(history) >= config.MIN_HISTORY_SAMPLES:
+        if is_actual and len(history) >= config.MIN_HISTORY_SAMPLES:
             anomaly, baseline = is_anomaly(entry["price"], history, config.ANOMALY_THRESHOLD)
             if anomaly:
                 log.warning("%s: АНОМАЛИЯ цена=%.0f медиана=%.0f", rid, entry["price"], baseline)
-                claim_alert(conn, rid, route, entry)
+                claim_alert(conn, rid, route, entry, reason="anomaly")
         else:
             log.info("%s: цена=%.0f (недостаточно истории или не actual)", rid, entry["price"])
+
+        # Независимо от статистики: билет в Москву дешевле фиксированного
+        # порога шлётся всегда — не заменяет проверку выше, а дополняет её
+        # (запрошено явно: "если 4200 — пусть всё равно пришлёт, даже если
+        # это и есть медиана", но более дешёвые аномалии продолжают ловиться
+        # тем же общим механизмом дедупа/ретраев).
+        if (is_actual and route["destination"] == "MOW"
+                and entry["price"] <= config.MOSCOW_PRICE_CEILING_RUB):
+            claim_alert(conn, rid, route, entry, reason="price_ceiling")
 
         record_price(conn, rid, entry)
 
@@ -804,6 +940,7 @@ def main():
     while True:
         process_telegram_commands(conn)
         routes = get_active_routes(conn)
+        maybe_send_heartbeat(conn, len(routes))
         if not routes:
             log.info("Маршруты не настроены — жду команду /add в Telegram")
             time.sleep(config.POLL_INTERVAL_SECONDS)
@@ -848,6 +985,7 @@ def run_once():
     process_telegram_commands(conn)
 
     routes = get_active_routes(conn)
+    maybe_send_heartbeat(conn, len(routes))
     if not routes:
         log.info("Маршруты не настроены (пусто) — нечего проверять в этом прогоне")
         conn.close()

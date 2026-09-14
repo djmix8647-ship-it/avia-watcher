@@ -1,0 +1,82 @@
+<svg width="1000" height="1000" viewBox="0 0 1000 1000" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="skyBg" cx="35%" cy="30%" r="80%">
+      <stop offset="0%" stop-color="#7ec8f2"/>
+      <stop offset="55%" stop-color="#2f8fd6"/>
+      <stop offset="100%" stop-color="#0f5fa8"/>
+    </radialGradient>
+    <linearGradient id="rimGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#dfe7ee"/>
+    </linearGradient>
+    <linearGradient id="planeGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#cfe8ff"/>
+    </linearGradient>
+    <linearGradient id="tagGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ff9a4d"/>
+      <stop offset="100%" stop-color="#e8511f"/>
+    </linearGradient>
+    <linearGradient id="bannerGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c6fb0"/>
+      <stop offset="100%" stop-color="#124a80"/>
+    </linearGradient>
+    <filter id="softShadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#04264a" flood-opacity="0.35"/>
+    </filter>
+    <filter id="tinyShadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#04264a" flood-opacity="0.4"/>
+    </filter>
+    <clipPath id="circleClip">
+      <circle cx="500" cy="500" r="452"/>
+    </clipPath>
+  </defs>
+
+  <!-- outer glossy rim -->
+  <circle cx="500" cy="500" r="480" fill="url(#rimGrad)" filter="url(#softShadow)"/>
+  <circle cx="500" cy="500" r="452" fill="url(#skyBg)"/>
+
+  <g clip-path="url(#circleClip)">
+    <!-- faint flight route dotted lines -->
+    <path d="M 120 640 Q 340 520 560 560 T 900 480" fill="none" stroke="#ffffff" stroke-opacity="0.28" stroke-width="6" stroke-dasharray="2 22" stroke-linecap="round"/>
+    <path d="M 60 380 Q 280 300 480 340 T 860 260" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="5" stroke-dasharray="2 20" stroke-linecap="round"/>
+    <circle cx="120" cy="640" r="7" fill="#ffffff" fill-opacity="0.5"/>
+    <circle cx="900" cy="480" r="7" fill="#ffffff" fill-opacity="0.5"/>
+
+    <!-- bottom banner -->
+    <rect x="0" y="700" width="1000" height="352" fill="url(#bannerGrad)"/>
+    <rect x="0" y="696" width="1000" height="10" fill="#ffffff" fill-opacity="0.25"/>
+
+    <!-- glossy 3D airplane -->
+    <g transform="translate(310,270) rotate(-18)" filter="url(#tinyShadow)">
+      <path d="M0,60 L230,0 L260,26 L110,86 L170,150 L130,160 L40,108 L-10,120 L-40,96 L10,80 Z"
+            fill="url(#planeGrad)" stroke="#9fc9ec" stroke-width="4"/>
+      <path d="M0,60 L230,0 L260,26 L110,86 Z" fill="#ffffff" fill-opacity="0.55"/>
+    </g>
+
+    <!-- price-drop tag -->
+    <g transform="translate(575,420) scale(0.85)" filter="url(#tinyShadow)">
+      <path d="M0,0 L150,0 Q175,0 175,25 L175,140 Q175,160 158,172 L100,210 Q88,218 76,210 L18,172 Q0,160 0,140 Z"
+            fill="url(#tagGrad)" stroke="#c23c0f" stroke-width="4"/>
+      <circle cx="87" cy="46" r="16" fill="#ffffff" fill-opacity="0.9"/>
+      <text x="87" y="128" text-anchor="middle" font-family="Arial, sans-serif" font-weight="800" font-size="64" fill="#ffffff">%</text>
+      <path d="M55,150 L87,190 L119,150" fill="none" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- banner text -->
+    <text x="500" y="798" text-anchor="middle" font-family="Arial, sans-serif" font-weight="900"
+          font-size="72" fill="#ffffff" letter-spacing="2">AVIA</text>
+    <text x="500" y="866" text-anchor="middle" font-family="Arial, sans-serif" font-weight="900"
+          font-size="72" fill="#ffffff" letter-spacing="2">WATCHER</text>
+    <text x="500" y="908" text-anchor="middle" font-family="Arial, sans-serif" font-weight="700"
+          font-size="27" fill="#cfe6fb" letter-spacing="1">ЛОВИМ ДЕШЁВЫЕ БИЛЕТЫ</text>
+  </g>
+
+  <!-- bell badge at very bottom, sits on the rim -->
+  <circle cx="500" cy="964" r="44" fill="#ffffff" filter="url(#tinyShadow)"/>
+  <g transform="translate(500,964)">
+    <path d="M-17,9 Q-17,-22 0,-22 Q17,-22 17,9 L22,17 L-22,17 Z" fill="#1c6fb0"/>
+    <circle cx="0" cy="22" r="5.5" fill="#1c6fb0"/>
+    <circle cx="0" cy="-22" r="3.5" fill="#1c6fb0"/>
+  </g>
+</svg>
