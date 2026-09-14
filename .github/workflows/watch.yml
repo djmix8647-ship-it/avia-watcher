@@ -2,7 +2,7 @@ name: avia-watcher
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 # Не даём двум прогонам работать одновременно над одной и той же prices.db —
