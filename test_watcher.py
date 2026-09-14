@@ -303,11 +303,19 @@ def test_request_spacing_keeps_burst_within_budget():
 
 
 def test_fetch_cheapest_handles_malformed_shapes_without_raising():
-    """REV-025: неожиданная форма JSON (не dict, data не список, элементы не
-    dict) не должна бросать AttributeError — только None + лог."""
+    """REV-025/REV-027: неожиданная форма JSON (не dict, data не список,
+    элементы не dict, нечисловая/NaN/Infinity цена) не должна бросать
+    исключение — только None + лог, либо переход к следующему элементу."""
     route = dict(TEST_ROUTE)
 
-    for body in ([], {"data": "not-a-list"}, {"data": ["not-a-dict"]}, {"data": [{}]}):
+    bad_bodies = [
+        [], {"data": "not-a-list"}, {"data": ["not-a-dict"]}, {"data": [{}]},
+        {"data": [{"price": "N/A"}]},
+        {"data": [{"price": float("nan")}]},
+        {"data": [{"price": float("inf")}]},
+        {"data": [{"price": None, "value": "also-not-a-number"}]},
+    ]
+    for body in bad_bodies:
         def fake_get(url, params, headers, timeout, _body=body):
             return FakeResponse(status_code=200, json_body=_body)
 
@@ -318,6 +326,36 @@ def test_fetch_cheapest_handles_malformed_shapes_without_raising():
         finally:
             watcher.requests.get = original_get
         assert result is None, f"неожиданная форма {body!r} должна давать None, не исключение"
+
+    # невалидный элемент, за которым идёт валидный — должен найти второй
+    mixed_body = {"data": [{"price": "N/A"}, {"price": 4200, "depart_date": "2026-11-10"}]}
+
+    def fake_get_mixed(url, params, headers, timeout):
+        return FakeResponse(status_code=200, json_body=mixed_body)
+
+    original_get = watcher.requests.get
+    watcher.requests.get = fake_get_mixed
+    try:
+        result = watcher.fetch_cheapest(route, "token", {})
+    finally:
+        watcher.requests.get = original_get
+    assert result is not None and result["price"] == 4200
+
+
+def test_pacing_does_not_burst_after_a_slow_request():
+    """REV-026: если предыдущий запрос занял дольше spacing, следующий не
+    должен планироваться на уже прошедшее время (что привело бы к всплеску
+    без пауз, пока график "догоняет" настоящее время)."""
+    spacing = 5.0
+
+    # штатный случай: пришли точно по расписанию
+    assert watcher.next_schedule_time(prev_next_at=100.0, spacing=spacing, now=100.0) == 105.0
+
+    # опоздали на 30с (например, медленный запрос) — следующий шаг планируется
+    # от текущего момента, а не от устаревшего графика (100+5=105 уже в прошлом)
+    next_at = watcher.next_schedule_time(prev_next_at=100.0, spacing=spacing, now=130.0)
+    assert next_at == 135.0, "опоздание не должно накапливаться в очередь без пауз"
+    assert next_at > 130.0, "следующий запрос обязан быть в будущем, а не немедленным"
 
 
 def run_all():
@@ -334,6 +372,7 @@ def run_all():
         test_telegram_429_uses_retry_after_not_generic_backoff,
         test_request_spacing_keeps_burst_within_budget,
         test_fetch_cheapest_handles_malformed_shapes_without_raising,
+        test_pacing_does_not_burst_after_a_slow_request,
     ]
     for test in tests:
         test()

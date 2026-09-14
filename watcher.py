@@ -164,14 +164,24 @@ def fetch_cheapest(route, token, rate_limited_until):
         price = item.get("price")
         if price is None:
             price = item.get("value")
-        if price is not None:
-            return {
-                "price": float(price),
-                "depart_date": item.get("depart_date") or item.get("departure_at"),
-                "return_date": item.get("return_date") or item.get("return_at"),
-                "link": item.get("link"),
-                "actual": item.get("actual"),
-            }
+        if price is None:
+            continue
+        # REV-027: price может оказаться нечисловой строкой/NaN/Infinity —
+        # float() или isfinite() могут дать ValueError/бросить мимо check_route.
+        # Пропускаем такой элемент (пробуем следующий), а не роняем всю функцию.
+        try:
+            price_value = float(price)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(price_value):
+            continue
+        return {
+            "price": price_value,
+            "depart_date": item.get("depart_date") or item.get("departure_at"),
+            "return_date": item.get("return_date") or item.get("return_at"),
+            "link": item.get("link"),
+            "actual": item.get("actual"),
+        }
 
     log.error(
         "%s: непустой ответ Travelpayouts, но не распознано поле цены — "
@@ -413,6 +423,16 @@ def compute_request_spacing(interval, n):
     return interval / n
 
 
+def next_schedule_time(prev_next_at, spacing, now):
+    """Следующая запланированная метка времени для пейсинга запросов.
+    Если предыдущий запрос занял дольше spacing (now уже проехал
+    prev_next_at), отсчёт ведётся от now, а не от устаревшего prev_next_at —
+    иначе отставание копится и выливается во всплеск запросов без пауз,
+    когда график наконец "догоняет" настоящее время (REV-026)."""
+    base = prev_next_at if prev_next_at > now else now
+    return base + spacing
+
+
 def main():
     if not config.TRAVELPAYOUTS_TOKEN or not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         raise SystemExit("Заполните TRAVELPAYOUTS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID в .env")
@@ -438,7 +458,7 @@ def main():
         now = time.monotonic()
         if next_at > now:
             time.sleep(next_at - now)
-        next_at += spacing
+        next_at = next_schedule_time(next_at, spacing, now)
 
         rid = route_id(route)
         try:
