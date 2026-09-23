@@ -26,9 +26,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Аэропорты вылета и направления — матрица ORIGINS x DESTINATIONS.
-ORIGINS = ["NAL", "MRV", "STW", "OGZ", "GRV"]
+ORIGINS = ["OVB"]
 # Нальчик, Минеральные Воды, Ставрополь, Владикавказ, Грозный
-DESTINATIONS = ["MOW", "LED"]
+DESTINATIONS = ["BKK"]
 # Москва (группа SVO/DME/VKO), Санкт-Петербург
 
 CURRENCY = "rub"
